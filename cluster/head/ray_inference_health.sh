@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # Check Ray cluster health
-VLLM_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E '^node-[0-9]+$' | head -n1)
-if [[ -z "${VLLM_CONTAINER}" ]]; then
-  echo "No node-* container running on this host." >&2
-  exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib.sh
+source "${SCRIPT_DIR}/../lib.sh"
+
+VLLM_CONTAINER=$(find_ray_container)
 
 docker exec "${VLLM_CONTAINER}" ray status
 

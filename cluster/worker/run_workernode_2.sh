@@ -35,6 +35,15 @@ NCCL_DEBUG_ARGS=()
 [[ -n "${NCCL_DEBUG:-}" ]]        && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG=${NCCL_DEBUG}")
 [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS}")
 
+# Model-specific env-var passthrough. Must match the head node's VLLM_FORWARD_VARS
+# (or be a superset of it) -- both ends need the same vLLM runtime flags for
+# rank 0 and rank 1 to agree on kernel backends and collective transports.
+# See nemotron/cluster-env.sh.
+EXTRA_ENV_ARGS=()
+for V in ${VLLM_FORWARD_VARS:-}; do
+  [[ -n "${!V:-}" ]] && EXTRA_ENV_ARGS+=(-e "$V=${!V}")
+done
+
 bash run_cluster.sh "$VLLM_IMAGE" "$HEAD_NODE_IP" --worker ~/.cache/huggingface \
   -e VLLM_HOST_IP="$VLLM_HOST_IP" \
   -e UCX_NET_DEVICES="$UCX_DEVS" \
@@ -46,4 +55,5 @@ bash run_cluster.sh "$VLLM_IMAGE" "$HEAD_NODE_IP" --worker ~/.cache/huggingface 
   -e TP_SOCKET_IFNAME="$PRIMARY_IF" \
   -e RAY_memory_monitor_refresh_ms=0 \
   -e MASTER_ADDR="$HEAD_NODE_IP" \
-  "${NCCL_DEBUG_ARGS[@]}"
+  "${NCCL_DEBUG_ARGS[@]}" \
+  "${EXTRA_ENV_ARGS[@]}"

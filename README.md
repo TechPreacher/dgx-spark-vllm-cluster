@@ -20,6 +20,7 @@ Operator scripts for a 2-node NVIDIA DGX Spark cluster running distributed LLM i
 
 ```
 cluster/
+  lib.sh                     # shared: load_env, find_ray_container (sourced by launchers + health)
   head/
     run_headnode_2.sh        # 4-port data plane, current default
     run_headnode.sh          # single-interface fallback
@@ -32,6 +33,11 @@ cluster/
 qwen/
   launch-qwen-30b.sh         # Qwen3-30B-A3B-Thinking-2507-FP8 (TP=2, 131k ctx)
   launch-qwen-122b.sh        # Qwen3.5-122B-A10B-FP8 (TP=2, 65k ctx, Qwen3-Next hybrid)
+  .env.example               # VLLM_API_KEY + HF_TOKEN template
+nemotron/
+  launch-nemotron-120b.sh    # NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (Ray TP=2, NVFP4)
+  cluster-env.sh             # NVFP4 runtime env -- MUST be sourced before cluster bring-up
+  .env.example               # VLLM_API_KEY + HF_TOKEN template
 CLAUDE.md                    # operator notes for Claude Code
 ```
 
@@ -73,8 +79,46 @@ curl http://<head-ip>:8000/v1/chat/completions \
 |---|---|---|---|---|---|
 | `qwen/launch-qwen-30b.sh` | Qwen3-30B-A3B-Thinking-2507-FP8 | 2 | 131072 | 0.70 | `deepseek_r1` reasoning, `hermes` tools |
 | `qwen/launch-qwen-122b.sh` | Qwen3.5-122B-A10B-FP8 | 2 | 65536 | 0.85 | Qwen3-Next hybrid MoE; ctx cut from 262k to fit KV+CUDA graphs |
+| `nemotron/launch-nemotron-120b.sh` | NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | 2 | 262144 | 0.75 | Ray TP=2 across both Sparks; NVFP4 native FP4 on SM121; LatentMoE hybrid (Mamba-2 + MoE + Attention) |
 
-FP8 chosen over MXFP4 to avoid marlin/CUTLASS/FlashInfer-sinks issues on GB10 (SM121). Do not pass `--quantization` — auto-detected.
+FP8 chosen over MXFP4 for the Qwen path (avoids marlin/CUTLASS/FlashInfer-sinks issues on GB10/SM121). The Nemotron path uses NVFP4 which is a natural fit for the GB10 FP4 tensor cores — do not switch its `--quantization` flag.
+
+Nemotron usage. The Ray cluster must be **brought up with Nemotron-specific env vars present in each container's start-time env**; Ray cannot propagate vLLM runtime flags from the head driver to worker ranks at vllm-serve time, so the workers would otherwise pick mismatched FP4 kernels / allreduce backends. Source `nemotron/cluster-env.sh` on **both** nodes before launching the bring-up scripts:
+
+```bash
+# Node 1 (head)
+source nemotron/cluster-env.sh
+cd cluster/head && bash run_headnode_2.sh
+
+# Node 2 (worker)
+source nemotron/cluster-env.sh
+cd cluster/worker && bash run_workernode_2.sh
+
+# Node 1 again, new terminal
+cd nemotron
+# .env needs HF_TOKEN and VLLM_API_KEY
+./launch-nemotron-120b.sh
+
+# Override knobs via env (see top of script):
+MAX_MODEL_LEN=1048576 GPU_MEM_UTIL=0.80 ENABLE_MTP=1 ./launch-nemotron-120b.sh
+ENABLE_EAGER=1 ./launch-nemotron-120b.sh   # skip CUDA graph capture if memory spikes on first inference
+```
+
+The launcher refuses to run if the four `VLLM_NVFP4_*` / `VLLM_FLASHINFER_*` / `VLLM_USE_FLASHINFER_MOE_FP4` / `VLLM_ALLOW_LONG_MAX_MODEL_LEN` vars are missing from the head container's env — it prints the tear-down/bring-up steps and exits non-zero.
+
+The Qwen path has no equivalent `cluster-env.sh` because its FP8 deployment requires no `VLLM_*` runtime-env overrides at container-start time — vLLM picks correct kernels and allreduce backends from its FP8 defaults. The cluster bring-up scripts treat `VLLM_FORWARD_VARS` as empty when unset, so you can bring the same cluster up for Qwen without sourcing anything.
+
+Nemotron host-stability safeguards:
+- `--gpu-memory-utilization 0.75` (conservative; NVIDIA's example uses 0.9).
+- `--max-model-len 262144` (model default, not the 1M maximum).
+- TP=2 across both Sparks roughly halves per-node weight memory vs. single-Spark.
+
+The Ray container is launched by `cluster/head/run_cluster.sh` **without** a `--memory` cgroup cap, so this launcher cannot add one. Host-side hardening on **both** Sparks is therefore not optional — the earlier `gpt-oss-120b` single-Spark crash that bricked sshd while ICMP still replied is the reason for the defenses listed below.
+
+Host-side hardening recommended once, outside this repo:
+- `sudo systemctl edit ssh` → add `[Service]\nOOMScoreAdjust=-1000`
+- `sudo apt install earlyoom && sudo systemctl enable --now earlyoom`
+- External watchdog (laptop): `curl :8000/health` every 30 s; IPMI/PDU-cycle on N failures.
 
 ## Networking knobs (passed into containers)
 

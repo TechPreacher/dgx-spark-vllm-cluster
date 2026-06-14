@@ -10,16 +10,12 @@ set -euo pipefail
 #   MrVolts/Qwen3-30B-A3B-Thinking-2507-NVFP4
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-  set -a; source "${SCRIPT_DIR}/.env"; set +a
-fi
+# shellcheck source=../cluster/lib.sh
+source "${SCRIPT_DIR}/../cluster/lib.sh"
+load_env "${SCRIPT_DIR}"
 : "${VLLM_API_KEY:?VLLM_API_KEY not set (expected in .env)}"
 
-VLLM_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E '^node-[0-9]+$' | head -n1)
-if [[ -z "${VLLM_CONTAINER}" ]]; then
-  echo "No node-* container running. Start the Ray cluster first." >&2
-  exit 1
-fi
+VLLM_CONTAINER=$(find_ray_container)
 echo "Using container: ${VLLM_CONTAINER}"
 
 docker exec -it -e VLLM_API_KEY="${VLLM_API_KEY}" "${VLLM_CONTAINER}" /bin/bash -c '

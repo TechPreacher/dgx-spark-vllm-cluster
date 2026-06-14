@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Bash scripts (no application code) that operate a 2-node NVIDIA DGX Spark (GB10 / SM121) Ray cluster running vLLM inside Docker for distributed LLM inference. The two Sparks are linked by 2× 200 GbE ConnectX-7 NICs (4 ports total, ~800 GbE aggregate data plane). Models tested: Qwen3-30B-A3B-Thinking-2507-FP8 and Qwen3.5-122B-A10B-FP8 across both nodes.
+Bash scripts (no application code) that operate a 2-node NVIDIA DGX Spark (GB10 / SM121) Ray cluster running vLLM inside Docker for distributed LLM inference. The two Sparks are linked by 2× 200 GbE ConnectX-7 NICs (4 ports total, ~800 GbE aggregate data plane). Models tested: Qwen3-30B-A3B-Thinking-2507-FP8 and Qwen3.5-122B-A10B-FP8 across both nodes. A third launcher (`nemotron/launch-nemotron-120b.sh`) runs NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 across the same 2-node Ray cluster (TP=2) using native NVFP4 on SM121 FP4 tensor cores.
 
 ## Bring-up sequence (must run in order)
 
@@ -35,7 +35,25 @@ The Qwen launch scripts encode tuning that is non-obvious:
 
 - **30B Thinking (FP8):** TP=2, ctx 131072, `gpu-memory-utilization 0.70`, `--reasoning-parser deepseek_r1`, `--tool-call-parser hermes`.
 - **122B A10B (FP8, Qwen3-Next hybrid Gated DeltaNet + Gated Attention MoE):** TP=2, ctx cut to **65536** (vs native 262k) and util raised to **0.85** because FP8 weights ~125 GB → ~63 GB/node on 128 GB unified memory leaves little headroom for KV+CUDA graphs. Parsers change to `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder`. `--trust-remote-code` required.
-FP8 (not MXFP4) is chosen everywhere to avoid marlin/CUTLASS/FlashInfer-sinks SM121 (GB10) issues. Do not pass `--quantization` — vLLM auto-detects from FP8 repos. The `"Config file not found ... GB10.json"` MoE warning at load is harmless (no hand-tuned MoE kernel config for GB10 yet).
+FP8 (not MXFP4) is chosen for the Qwen path to avoid marlin/CUTLASS/FlashInfer-sinks SM121 (GB10) issues. Do not pass `--quantization` on Qwen — vLLM auto-detects from FP8 repos. The `"Config file not found ... GB10.json"` MoE warning at load is harmless (no hand-tuned MoE kernel config for GB10 yet).
+
+## Nemotron-3-Super-120B-A12B-NVFP4 (Ray TP=2 across both Sparks)
+
+`nemotron/launch-nemotron-120b.sh` follows the same pattern as the Qwen launchers: `docker exec` into the running `^node-[0-9]+$` head container and `vllm serve` with `--tensor-parallel-size 2`, letting Ray dispatch shard 2 to the worker over the 800 GbE data plane. It does NOT do a `docker run` of its own — the Ray cluster must already be up (`run_headnode_2.sh` + `run_workernode_2.sh`).
+
+The model is NVFP4-quantized (native GB10/SM121 FP4 tensor cores) and is a LatentMoE hybrid (Mamba-2 + MoE + Attention). `--mamba-ssm-cache-dtype float16` matters; the reasoning parser is a plugin file (`super_v3_reasoning_parser.py`) the launcher fetches **inside the container** at exec time and stores under `~/.cache/huggingface/` (which is bind-mounted, so it survives Ray container restarts). No host-side bind mount of the parser is needed.
+
+Required env (set in `nemotron/.env`): `HF_TOKEN`, `VLLM_API_KEY`. Unlike the Qwen launchers, `--quantization fp4` and `--moe-backend marlin` are passed explicitly per NVIDIA's DGX Spark example.
+
+**Critical bring-up requirement** that the Qwen path does not have: the four NVFP4 runtime env vars (`VLLM_NVFP4_GEMM_BACKEND=marlin`, `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm`, `VLLM_USE_FLASHINFER_MOE_FP4=0`, `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`) must be present in each Ray container's env at `docker run` time, **on both nodes**. Ray does not propagate `os.environ` from the head driver to worker ranks across nodes; rank 1 in the worker container therefore inherits only that container's start-time env. If the four vars are missing on the worker, rank 1 picks a different FP4 GEMM kernel / allreduce backend than rank 0 → mismatch, collective hang, or crash at first matmul. The launcher refuses to run if it doesn't see them inside the head container and prints the bring-up instructions.
+
+The mechanism: both `run_headnode_2.sh` and `run_workernode_2.sh` now read a space-separated `VLLM_FORWARD_VARS` from the parent shell and forward each named var into the container as `-e VAR=value`. `nemotron/cluster-env.sh` exports the four NVFP4 vars and sets `VLLM_FORWARD_VARS` to enumerate them. Both nodes must `source nemotron/cluster-env.sh` before running the bring-up script. To add new model-specific runtime flags in the future, append their names to `VLLM_FORWARD_VARS` rather than editing the bring-up scripts.
+
+There is intentionally no `qwen/cluster-env.sh` — the Qwen FP8 path requires no `VLLM_*` runtime-env overrides at container-start time. Bringing the cluster up without sourcing any profile is the correct flow for Qwen. The passthrough loop is a no-op when `VLLM_FORWARD_VARS` is unset.
+
+**Host-stability context:** an earlier `gpt-oss-120b` single-Spark run starved the host of memory so badly that sshd became unreachable while ICMP still replied; recovery required a power cycle. With TP=2, per-node weight memory is roughly halved versus that single-Spark run, but the Ray container has no `--memory` cgroup cap (that's set by `run_cluster.sh` at container create time, not editable after the fact). Defences here are: `--gpu-memory-utilization 0.75` (vs NVIDIA's 0.9), `--max-model-len 262144` (vs 1M), and an opt-in `ENABLE_EAGER=1` that skips CUDA graph capture if first-inference memory spikes are a concern. MTP speculative decoding is off by default; enable with `ENABLE_MTP=1`.
+
+Out-of-repo hardening that complements the launcher (apply on **both** Sparks): `OOMScoreAdjust=-1000` on sshd via `systemctl edit ssh`, `earlyoom` package installed and enabled, plus an external laptop-side watchdog that IPMI/PDU-cycles on repeated `/health` failures.
 
 ## Health / monitoring
 

@@ -29,6 +29,17 @@ NCCL_DEBUG_ARGS=()
 [[ -n "${NCCL_DEBUG:-}" ]]        && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG=${NCCL_DEBUG}")
 [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS}")
 
+# Model-specific env-var passthrough. Set VLLM_FORWARD_VARS to a space-separated
+# list of variable names that should be forwarded into the Ray container's env
+# at start time. Cross-node vLLM workers spawned by Ray inherit this container
+# env (they cannot pick up vars set later via `docker exec -e`), so model
+# launchers that depend on these (e.g. Nemotron NVFP4) require the cluster to
+# be brought up with them already exported. See nemotron/cluster-env.sh.
+EXTRA_ENV_ARGS=()
+for V in ${VLLM_FORWARD_VARS:-}; do
+  [[ -n "${!V:-}" ]] && EXTRA_ENV_ARGS+=(-e "$V=${!V}")
+done
+
 bash run_cluster.sh "$VLLM_IMAGE" "$VLLM_HOST_IP" --head ~/.cache/huggingface \
   -e VLLM_HOST_IP="$VLLM_HOST_IP" \
   -e UCX_NET_DEVICES="$UCX_DEVS" \
@@ -40,4 +51,5 @@ bash run_cluster.sh "$VLLM_IMAGE" "$VLLM_HOST_IP" --head ~/.cache/huggingface \
   -e TP_SOCKET_IFNAME="$PRIMARY_IF" \
   -e RAY_memory_monitor_refresh_ms=0 \
   -e MASTER_ADDR="$VLLM_HOST_IP" \
-  "${NCCL_DEBUG_ARGS[@]}"
+  "${NCCL_DEBUG_ARGS[@]}" \
+  "${EXTRA_ENV_ARGS[@]}"
