@@ -22,7 +22,10 @@ set -euo pipefail
 # container is launched by run_cluster.sh without a `--memory` cgroup cap, so
 # this launcher CANNOT add one. Defences here are softer:
 #   1. `--gpu-memory-utilization 0.75`  conservative on both nodes.
-#   2. `--max-model-len 262144`         model default; raise via env once stable.
+#   2. `--max-model-len 524288`         512k tokens. Halfway between the 256k
+#                                       conservative default and the 1M model
+#                                       maximum. Override via MAX_MODEL_LEN
+#                                       (262144 to back off, 1048576 to push).
 #   3. `ENABLE_EAGER=1` opt-in          skips CUDA graph capture (memory spike).
 #
 # Required out-of-repo hardening (configure once on BOTH nodes):
@@ -44,7 +47,7 @@ load_env "${SCRIPT_DIR}"
 # --- Overridable knobs (env-driven) ---
 MODEL_CKPT="${MODEL_CKPT:-nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4}"
 SERVED_NAME="${SERVED_NAME:-nvidia/nemotron-3-super}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.75}"
 TP_SIZE="${TP_SIZE:-2}"
 PP_SIZE="${PP_SIZE:-1}"

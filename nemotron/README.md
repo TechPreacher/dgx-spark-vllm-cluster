@@ -2,7 +2,7 @@
 
 | Script | Model | TP | ctx | Quant |
 |---|---|---|---|---|
-| `launch-nemotron-120b.sh` | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 2 | 262144 | NVFP4 (native SM121 FP4 tensor cores) |
+| `launch-nemotron-120b.sh` | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 2 | 524288 | NVFP4 (native SM121 FP4 tensor cores) |
 
 LatentMoE hybrid (Mamba-2 + MoE + Attention). 120B total / 12B active. Reasoning parser plugin (`super_v3_reasoning_parser.py`) is fetched into the container on first launch.
 
@@ -38,7 +38,8 @@ The launcher refuses to start if the four NVFP4 vars are missing inside the head
 ## Overrides (env)
 
 ```bash
-MAX_MODEL_LEN=1048576 ./launch-nemotron-120b.sh   # raise context to 1M (KV cache grows linearly)
+MAX_MODEL_LEN=1048576 ./launch-nemotron-120b.sh   # push to model maximum (1M); watch host memory
+MAX_MODEL_LEN=262144  ./launch-nemotron-120b.sh   # drop back to 256k if 512k strains host memory
 GPU_MEM_UTIL=0.85     ./launch-nemotron-120b.sh   # raise from the default 0.75
 ENABLE_MTP=1          ./launch-nemotron-120b.sh   # MTP speculative decoding
 ENABLE_EAGER=1        ./launch-nemotron-120b.sh   # disable CUDA graphs (stability over speed)
