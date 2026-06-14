@@ -1,0 +1,68 @@
+# ============================================================================
+# Qwen3.6-35B-A3B-FP8 on a single NVIDIA DGX Spark (GB10 / SM121)
+# Recommended single-Spark daily driver: FP8 (no MXFP4/SM121 kernel issues),
+# 35B total / 3B active MoE (fast + fits with large headroom).
+# Save this as compose.yml in your project dir, then: HF_TOKEN=hf_xxx docker compose up -d
+# ============================================================================
+
+services:
+  vllm:
+    image: nvcr.io/nvidia/vllm:26.05.post1-py3
+    container_name: vllm-qwen36
+    gpus: all
+    network_mode: host
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command: >
+      vllm serve Qwen/Qwen3.6-35B-A3B-FP8
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --gpu-memory-utilization 0.70
+      --max-model-len 32768
+      --kv-cache-dtype fp8
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --trust-remote-code
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+      --reasoning-parser qwen3
+    restart: unless-stopped
+
+# ----------------------------------------------------------------------------
+# NOTES
+#
+# Why this is easier than gpt-oss-120b:
+#   * FP8 (not MXFP4) -> no marlin/CUTLASS/FlashInfer-sinks SM121 problems.
+#   * ~35 GB footprint on 121 GB -> no first-inference memory-spike freeze, so
+#     NO --enforce-eager needed (CUDA graphs fit; you keep full speed).
+#   * MoE with ~3B active params -> fast decode (~28-30 tok/s single-user).
+#
+# Quantization is auto-detected from the FP8 repo -- do NOT pass --quantization.
+#
+# Expected harmless log line:
+#   "WARNING: Using default MoE config ... Config file not found ... GB10.json"
+#   There is no hand-tuned MoE kernel config for GB10 yet; auto defaults work.
+#
+# If (unexpectedly) memory climbs toward the ceiling on first inference, add:
+#   --enforce-eager
+# It disables CUDA graphs (stability over speed). Shouldn't be needed at 35B.
+#
+# Alternatives (single Spark):
+#   * Qwen/Qwen3.5-35B-A3B-FP8  -> slightly older, most battle-tested on Spark.
+#   * openai/gpt-oss-20b        -> already validated on your box; zero new setup.
+#
+# Testing (from your laptop, not on the Spark):
+#   curl http://pulsar:8000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"Qwen/Qwen3.6-35B-A3B-FP8","messages":[{"role":"user","content":"12*17"}],"max_tokens":500}'
+#   Watch:  ./mem-watch-local.sh        (on the Spark)
+#           docker logs -f vllm-qwen36  (load progress, ready line)
+#
+# Pre-stage weights once to avoid a slow first-launch download:
+#   hf download Qwen/Qwen3.6-35B-A3B-FP8
+# ----------------------------------------------------------------------------
