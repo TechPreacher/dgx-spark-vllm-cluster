@@ -22,7 +22,7 @@ fi
 # Override via shell env if head moves: HEAD_NODE_IP=10.0.1.4 bash run_workernode_2.sh
 export HEAD_NODE_IP="${HEAD_NODE_IP:-10.0.1.3}"
 
-export VLLM_IMAGE=nvcr.io/nvidia/vllm:25.11-py3
+export VLLM_IMAGE="${VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.05.post1-py3}"
 
 echo "Primary (control) interface: $PRIMARY_IF  IP: $VLLM_HOST_IP"
 echo "Data-plane interfaces:       $DATA_IFS"

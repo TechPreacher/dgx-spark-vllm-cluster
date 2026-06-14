@@ -50,15 +50,28 @@ TP_SIZE="${TP_SIZE:-2}"
 PP_SIZE="${PP_SIZE:-1}"
 PORT="${PORT:-8000}"
 
+# vLLM flag toggles. Defaults match the HF card's recommendation for the
+# upgraded cluster image (nvcr.io/nvidia/vllm:26.05.post1-py3). If you fall back to
+# an older image that rejects any of these, flip the corresponding env to 0
+# (or empty string) instead of editing this file.
+ENABLE_REASONING_PARSER="${ENABLE_REASONING_PARSER:-1}"
+ENABLE_ASYNC_SCHEDULING="${ENABLE_ASYNC_SCHEDULING:-1}"
+MOE_BACKEND="${MOE_BACKEND:-marlin}"
+CUDAGRAPH_CAPTURE_SIZE="${CUDAGRAPH_CAPTURE_SIZE:-128}"
+
 VLLM_CONTAINER=$(find_ray_container)
 echo "Using container: ${VLLM_CONTAINER}"
-echo "  model:           ${MODEL_CKPT}"
-echo "  TP / PP:         ${TP_SIZE} / ${PP_SIZE}"
-echo "  max-model-len:   ${MAX_MODEL_LEN}"
-echo "  gpu-mem-util:    ${GPU_MEM_UTIL}"
-echo "  MTP spec decode: ${ENABLE_MTP:-0}"
-echo "  enforce-eager:   ${ENABLE_EAGER:-0}"
-echo "  port:            ${PORT}"
+echo "  model:               ${MODEL_CKPT}"
+echo "  TP / PP:             ${TP_SIZE} / ${PP_SIZE}"
+echo "  max-model-len:       ${MAX_MODEL_LEN}"
+echo "  gpu-mem-util:        ${GPU_MEM_UTIL}"
+echo "  MTP spec decode:     ${ENABLE_MTP:-0}"
+echo "  enforce-eager:       ${ENABLE_EAGER:-0}"
+echo "  reasoning parser:    ${ENABLE_REASONING_PARSER}"
+echo "  async scheduling:    ${ENABLE_ASYNC_SCHEDULING}"
+echo "  moe backend:         ${MOE_BACKEND:-(default)}"
+echo "  cudagraph capture:   ${CUDAGRAPH_CAPTURE_SIZE:-(default)}"
+echo "  port:                ${PORT}"
 
 # Optional MTP speculative decoding (off by default; HF DGX Spark example
 # uses {"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}).
@@ -119,19 +132,30 @@ docker exec -it \
   -e PORT="${PORT}" \
   -e SPEC_FLAG="${SPEC_FLAG}" \
   -e EAGER_FLAG="${EAGER_FLAG}" \
+  -e ENABLE_REASONING_PARSER="${ENABLE_REASONING_PARSER}" \
+  -e ENABLE_ASYNC_SCHEDULING="${ENABLE_ASYNC_SCHEDULING}" \
+  -e MOE_BACKEND="${MOE_BACKEND}" \
+  -e CUDAGRAPH_CAPTURE_SIZE="${CUDAGRAPH_CAPTURE_SIZE}" \
+  -e MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-auto}" \
   "${VLLM_CONTAINER}" /bin/bash -c '
     set -euo pipefail
 
-    # Fetch reasoning parser plugin inside the container (cached in HF cache so
-    # it survives container restarts as long as ~/.cache/huggingface is mounted,
-    # which it is per run_cluster.sh).
-    PARSER=/root/.cache/huggingface/super_v3_reasoning_parser.py
-    if [[ ! -f "${PARSER}" ]]; then
-      echo "Fetching reasoning parser plugin..."
-      curl -fsSL \
-        -o "${PARSER}" \
-        "https://huggingface.co/${MODEL_CKPT}/raw/main/super_v3_reasoning_parser.py"
+    # Build optional flag list based on what the installed vLLM supports.
+    OPT_FLAGS=()
+    if [[ "${ENABLE_REASONING_PARSER}" == "1" ]]; then
+      # Fetch the plugin once; cached in HF cache so it survives container
+      # restarts (~/.cache/huggingface is bind-mounted by run_cluster.sh).
+      PARSER=/root/.cache/huggingface/super_v3_reasoning_parser.py
+      if [[ ! -f "${PARSER}" ]]; then
+        echo "Fetching reasoning parser plugin..."
+        curl -fsSL -o "${PARSER}" \
+          "https://huggingface.co/${MODEL_CKPT}/raw/main/super_v3_reasoning_parser.py"
+      fi
+      OPT_FLAGS+=(--reasoning-parser-plugin "${PARSER}" --reasoning-parser super_v3)
     fi
+    [[ "${ENABLE_ASYNC_SCHEDULING}" == "1" ]] && OPT_FLAGS+=(--async-scheduling)
+    [[ -n "${MOE_BACKEND}" ]]                && OPT_FLAGS+=(--moe-backend "${MOE_BACKEND}")
+    [[ -n "${CUDAGRAPH_CAPTURE_SIZE}" ]]     && OPT_FLAGS+=(--max-cudagraph-capture-size "${CUDAGRAPH_CAPTURE_SIZE}")
 
     # shellcheck disable=SC2086
     exec vllm serve "${MODEL_CKPT}" \
@@ -142,21 +166,17 @@ docker exec -it \
       --pipeline-parallel-size "${PP_SIZE}" \
       --data-parallel-size 1 \
       --quantization fp4 \
-      --moe-backend marlin \
       --dtype auto \
       --kv-cache-dtype fp8 \
-      --mamba-ssm-cache-dtype "${MAMBA_SSM_DTYPE:-auto}" \
+      --mamba-ssm-cache-dtype "${MAMBA_SSM_DTYPE}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-      --max-cudagraph-capture-size 128 \
       --enable-chunked-prefill \
-      --async-scheduling \
       --swap-space 0 \
       --trust-remote-code \
-      --reasoning-parser-plugin "${PARSER}" \
-      --reasoning-parser super_v3 \
       --enable-auto-tool-choice \
       --tool-call-parser qwen3_coder \
+      "${OPT_FLAGS[@]}" \
       ${EAGER_FLAG} \
       ${SPEC_FLAG}
   '

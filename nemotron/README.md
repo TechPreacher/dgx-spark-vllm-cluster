@@ -44,7 +44,20 @@ ENABLE_MTP=1          ./launch-nemotron-120b.sh   # MTP speculative decoding
 ENABLE_EAGER=1        ./launch-nemotron-120b.sh   # disable CUDA graphs (stability over speed)
 ```
 
-Other knobs: `MODEL_CKPT`, `SERVED_NAME`, `TP_SIZE`, `PP_SIZE`, `PORT`.
+Other knobs: `MODEL_CKPT`, `SERVED_NAME`, `TP_SIZE`, `PP_SIZE`, `PORT`, `MAMBA_SSM_DTYPE`.
+
+### vLLM-version-dependent flags (defaults match `nvcr.io/nvidia/vllm:26.05.post1-py3`)
+
+The launcher turns the following flags ON by default, matching NVIDIA's HF model card for an `nvcr.io/nvidia/vllm:26.05.post1-py3` cluster image. If you fall back to an older image (e.g. `25.11-py3`) and one of them errors, opt out:
+
+```bash
+ENABLE_REASONING_PARSER=0  ./launch-nemotron-120b.sh   # drops --reasoning-parser-plugin + --reasoning-parser super_v3
+ENABLE_ASYNC_SCHEDULING=0  ./launch-nemotron-120b.sh   # drops --async-scheduling
+MOE_BACKEND=               ./launch-nemotron-120b.sh   # drops --moe-backend (vLLM picks default)
+CUDAGRAPH_CAPTURE_SIZE=    ./launch-nemotron-120b.sh   # drops --max-cudagraph-capture-size
+```
+
+With reasoning parser off, thinking tokens come back in `message.content` rather than being split into a `reasoning_content` field.
 
 ## Smoke test
 
