@@ -8,13 +8,21 @@ export DATA_IFS=enp1s0f0np0,enp1s0f1np1,enP2p1s0f0np0,enP2p1s0f1np1
 export VLLM_HOST_IP=$(ip -4 addr show $PRIMARY_IF | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
 
 # Head's primary IP (its enp1s0f1np1 under the new /24 plan).
-export HEAD_NODE_IP=10.0.1.3
+# Override via shell env if head moves: HEAD_NODE_IP=10.0.1.4 bash run_workernode_2.sh
+export HEAD_NODE_IP="${HEAD_NODE_IP:-10.0.1.3}"
 
 export VLLM_IMAGE=nvcr.io/nvidia/vllm:25.11-py3
 
 echo "Primary (control) interface: $PRIMARY_IF  IP: $VLLM_HOST_IP"
 echo "Data-plane interfaces:       $DATA_IFS"
 echo "Connecting to head node at:  $HEAD_NODE_IP"
+
+# Optional verbose NCCL logging. Set in shell env before launching, e.g.:
+#   NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET bash run_workernode_2.sh
+# Default (unset) keeps logs quiet for steady-state operation.
+NCCL_DEBUG_ARGS=()
+[[ -n "${NCCL_DEBUG:-}" ]]        && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG=${NCCL_DEBUG}")
+[[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS}")
 
 bash run_cluster.sh $VLLM_IMAGE $HEAD_NODE_IP --worker ~/.cache/huggingface \
   -e VLLM_HOST_IP=$VLLM_HOST_IP \
@@ -27,5 +35,4 @@ bash run_cluster.sh $VLLM_IMAGE $HEAD_NODE_IP --worker ~/.cache/huggingface \
   -e TP_SOCKET_IFNAME=$PRIMARY_IF \
   -e RAY_memory_monitor_refresh_ms=0 \
   -e MASTER_ADDR=$HEAD_NODE_IP \
-  -e NCCL_DEBUG=INFO \
-  -e NCCL_DEBUG_SUBSYS=INIT,NET
+  "${NCCL_DEBUG_ARGS[@]}"

@@ -124,7 +124,7 @@ docker run \
     --entrypoint /bin/bash \
     --network host \
     --name "${CONTAINER_NAME}" \
-    --shm-size 10.24g \
+    --shm-size 16g \
     --gpus all \
     --device=/dev/infiniband \
     --cap-add=IPC_LOCK \

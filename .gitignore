@@ -1,0 +1,10 @@
+.env
+*/.env
+**/.env
+
+# macOS
+.DS_Store
+
+# Backups
+*.bak
+*~

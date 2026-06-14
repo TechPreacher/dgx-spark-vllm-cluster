@@ -21,9 +21,11 @@ Each `run_*node_2.sh` script blocks (it `docker run`s with the Ray `--block` com
 - **`run_headnode_2.sh` / `run_workernode_2.sh` (current, in use):** 4-port data plane. `PRIMARY_IF=enp1s0f1np1` carries Ray control (single IP for `VLLM_HOST_IP` / `MASTER_ADDR`). `DATA_IFS=enp1s0f0np0,enp1s0f1np1,enP2p1s0f0np0,enP2p1s0f1np1` is exported to `UCX_NET_DEVICES`, `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, and `OMPI_MCA_btl_tcp_if_include`. NCCL is told the 4 RoCE HCAs via `NCCL_IB_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1` with `NCCL_CROSS_NIC=1`. `TP_SOCKET_IFNAME` is pinned to `PRIMARY_IF` so PyTorch TP setup uses the control IP.
 - **`run_headnode.sh` / `run_workernode.sh` (older, single-interface):** Only `enp1s0f1np1`, no IB env. Kept for fallback; do not edit when the 4-port path is in use.
 
-Both call `cluster/{head,worker}/run_cluster.sh`. The head-side copy adds `--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1:-1` to the `docker run` — the worker-side copy currently does not. Keep that in mind if you change one: edit both unless you know why they differ.
+Both call `cluster/{head,worker}/run_cluster.sh`. The two copies are kept byte-identical (`--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1:-1` on both, `--shm-size 16g`). If you edit one, copy to the other — RoCE/IB device passthrough must exist on both sides or NCCL silently falls back to TCP and you lose the ~800 GbE data plane.
 
-`run_cluster.sh` positional args: `<image> <head_node_ip> --head|--worker <hf_cache_path> [extra docker args...]`. It extracts `VLLM_HOST_IP` from the extra args, names the container `node-${RANDOM}`, and traps `EXIT` to `docker stop && docker rm` on script exit.
+`run_cluster.sh` positional args: `<image> <head_node_ip> --head|--worker <hf_cache_path> [extra docker args...]`. It extracts `VLLM_HOST_IP` from the extra args, names the container `node-${RANDOM}`, and traps `EXIT` to `docker stop && docker rm` on script exit. Caveat: Ctrl-C on the head terminal stops only the head container; the worker `ray start --block` keeps running attached to a now-dead head — `docker stop node-*` on the worker by hand to clean up.
+
+Optional verbose NCCL logging (off by default): prefix the launch with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET bash run_*node_2.sh`. Worker head IP override: `HEAD_NODE_IP=10.0.1.x bash run_workernode_2.sh`.
 
 Image: `nvcr.io/nvidia/vllm:25.11-py3` for the Ray cluster path; `nvcr.io/nvidia/vllm:26.05.post1-py3` for the single-Spark Compose path. HuggingFace cache is bind-mounted from `~/.cache/huggingface`.
 

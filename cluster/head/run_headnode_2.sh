@@ -11,6 +11,13 @@ export VLLM_IMAGE=nvcr.io/nvidia/vllm:25.11-py3
 echo "Primary (control) interface: $PRIMARY_IF  IP: $VLLM_HOST_IP"
 echo "Data-plane interfaces:       $DATA_IFS"
 
+# Optional verbose NCCL logging. Set in shell env before launching, e.g.:
+#   NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET bash run_headnode_2.sh
+# Default (unset) keeps logs quiet for steady-state operation.
+NCCL_DEBUG_ARGS=()
+[[ -n "${NCCL_DEBUG:-}" ]]        && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG=${NCCL_DEBUG}")
+[[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && NCCL_DEBUG_ARGS+=(-e "NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS}")
+
 bash run_cluster.sh $VLLM_IMAGE $VLLM_HOST_IP --head ~/.cache/huggingface \
   -e VLLM_HOST_IP=$VLLM_HOST_IP \
   -e UCX_NET_DEVICES=$DATA_IFS \
@@ -22,5 +29,4 @@ bash run_cluster.sh $VLLM_IMAGE $VLLM_HOST_IP --head ~/.cache/huggingface \
   -e TP_SOCKET_IFNAME=$PRIMARY_IF \
   -e RAY_memory_monitor_refresh_ms=0 \
   -e MASTER_ADDR=$VLLM_HOST_IP \
-  -e NCCL_DEBUG=INFO \
-  -e NCCL_DEBUG_SUBSYS=INIT,NET
+  "${NCCL_DEBUG_ARGS[@]}"
