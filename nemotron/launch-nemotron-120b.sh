@@ -173,7 +173,6 @@ docker exec -it \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --enable-chunked-prefill \
-      --swap-space 0 \
       --trust-remote-code \
       --enable-auto-tool-choice \
       --tool-call-parser qwen3_coder \
