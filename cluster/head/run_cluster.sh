@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 #
 # Launch a Ray cluster inside Docker for vLLM inference.
 #
@@ -87,11 +88,12 @@ if [[ "${NODE_TYPE}" == "--head" && -n "${VLLM_HOST_IP}" ]]; then
     fi
 fi
 
-# Generate a unique container name with random suffix.
-# Docker container names must be unique on each host.
-# The random suffix allows multiple Ray containers to run simultaneously on the same machine,
-# for example, on a multi-GPU machine.
-CONTAINER_NAME="node-${RANDOM}"
+# Generate a unique container name. $RANDOM is only 15-bit so it can collide
+# across rapid reruns or after reboots; mix in epoch seconds + PID so the name
+# is unique for the lifetime of the host. The "node-<digits>" shape is preserved
+# so the launcher / health scripts that match ^node-[0-9]+$ keep working when
+# only one Ray container is running.
+CONTAINER_NAME="node-$(date +%s)$$"
 
 # Define a cleanup routine that removes the container when the script exits.
 # This prevents orphaned containers from accumulating if the script is interrupted.

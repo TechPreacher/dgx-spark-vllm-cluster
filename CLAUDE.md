@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Bash scripts (no application code) that operate a 2-node NVIDIA DGX Spark (GB10 / SM121) Ray cluster running vLLM inside Docker for distributed LLM inference. The two Sparks are linked by 2× 200 GbE ConnectX-7 NICs (4 ports total, ~800 GbE aggregate data plane). Models tested: Qwen3-30B-A3B-Thinking-2507-FP8 and Qwen3.5-122B-A10B-FP8 across both nodes; Qwen3.6-35B-A3B-FP8 single-Spark via Docker Compose.
+Bash scripts (no application code) that operate a 2-node NVIDIA DGX Spark (GB10 / SM121) Ray cluster running vLLM inside Docker for distributed LLM inference. The two Sparks are linked by 2× 200 GbE ConnectX-7 NICs (4 ports total, ~800 GbE aggregate data plane). Models tested: Qwen3-30B-A3B-Thinking-2507-FP8 and Qwen3.5-122B-A10B-FP8 across both nodes.
 
 ## Bring-up sequence (must run in order)
 
@@ -27,7 +27,7 @@ Both call `cluster/{head,worker}/run_cluster.sh`. The two copies are kept byte-i
 
 Optional verbose NCCL logging (off by default): prefix the launch with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET bash run_*node_2.sh`. Worker head IP override: `HEAD_NODE_IP=10.0.1.x bash run_workernode_2.sh`.
 
-Image: `nvcr.io/nvidia/vllm:25.11-py3` for the Ray cluster path; `nvcr.io/nvidia/vllm:26.05.post1-py3` for the single-Spark Compose path. HuggingFace cache is bind-mounted from `~/.cache/huggingface`.
+Image: `nvcr.io/nvidia/vllm:25.11-py3`. HuggingFace cache is bind-mounted from `~/.cache/huggingface`.
 
 ## Model launch — what to know before editing
 
@@ -35,16 +35,16 @@ The Qwen launch scripts encode tuning that is non-obvious:
 
 - **30B Thinking (FP8):** TP=2, ctx 131072, `gpu-memory-utilization 0.70`, `--reasoning-parser deepseek_r1`, `--tool-call-parser hermes`.
 - **122B A10B (FP8, Qwen3-Next hybrid Gated DeltaNet + Gated Attention MoE):** TP=2, ctx cut to **65536** (vs native 262k) and util raised to **0.85** because FP8 weights ~125 GB → ~63 GB/node on 128 GB unified memory leaves little headroom for KV+CUDA graphs. Parsers change to `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder`. `--trust-remote-code` required.
-- **35B A3B (FP8) single-Spark Compose:** TP=1, ctx 32768, `kv-cache-dtype fp8`. FP8 (not MXFP4) is chosen to avoid marlin/CUTLASS/FlashInfer-sinks SM121 (GB10) issues; the comment in `qwen/compose.yml` warns that the `"Config file not found ... GB10.json"` MoE warning is harmless. Do not pass `--quantization` — auto-detected from FP8 repos.
+FP8 (not MXFP4) is chosen everywhere to avoid marlin/CUTLASS/FlashInfer-sinks SM121 (GB10) issues. Do not pass `--quantization` — vLLM auto-detects from FP8 repos. The `"Config file not found ... GB10.json"` MoE warning at load is harmless (no hand-tuned MoE kernel config for GB10 yet).
 
 ## Health / monitoring
 
-- `cluster/head/ray_inference_health.sh` — `ray status` in container, `curl :8000/health`, `nvidia-smi` on host + in container.
-- `cluster/{head,worker}/mem-watch.sh` — local `free -m` sampler. Comment warns: runs on the Spark itself, so a host freeze takes the watcher with it; use a laptop-side equivalent for freeze detection.
+- `cluster/head/ray_inference_health.sh` — `ray status` in container, `curl :8000/health`, `nvidia-smi` on host + in container. Exits non-zero if no `node-*` container is running.
 
 ## Things that look risky and aren't (and vice-versa)
 
 - The `Warning: VLLM_HOST_IP differs from head_node_ip` branch in `run_cluster.sh` resolves by trusting `VLLM_HOST_IP` — intentional.
 - `RAY_memory_monitor_refresh_ms=0` disables Ray's OOM killer; deliberate for vLLM workloads.
 - `TP_SOCKET_IFNAME=$PRIMARY_IF` (not `$DATA_IFS`) is intentional — PyTorch TP rendezvous needs a single IP; data plane is for NCCL/UCX.
-- `update.sh` files only update host packages (brew, pipx). They have nothing to do with the cluster.
+- `UCX_NET_DEVICES` uses RDMA device names with `:1` port suffix (e.g. `rocep1s0f0:1`), not netdev names — UCX needs the RDMA device path to use the RoCE transport rather than falling back to TCP.
+- `CONTAINER_NAME="node-$(date +%s)$$"` keeps the `^node-[0-9]+$` shape that all the launcher / health scripts grep for, while avoiding the `$RANDOM` (15-bit) collision risk across rapid reruns.

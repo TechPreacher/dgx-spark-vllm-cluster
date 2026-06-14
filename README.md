@@ -25,19 +25,13 @@ cluster/
     run_headnode.sh          # single-interface fallback
     run_cluster.sh           # generic Ray+Docker launcher (head/worker)
     ray_inference_health.sh  # ray status + /health + nvidia-smi
-    mem-watch.sh             # local free -m sampler
-    update.sh                # host package updates (brew, pipx)
   worker/
     run_workernode_2.sh      # 4-port data plane, current default
     run_workernode.sh        # single-interface fallback
     run_cluster.sh           # byte-identical to head/run_cluster.sh
-    mem-watch.sh
-    update.sh
 qwen/
   launch-qwen-30b.sh         # Qwen3-30B-A3B-Thinking-2507-FP8 (TP=2, 131k ctx)
   launch-qwen-122b.sh        # Qwen3.5-122B-A10B-FP8 (TP=2, 65k ctx, Qwen3-Next hybrid)
-  compose.yml                # single-Spark Qwen3.6-35B-A3B-FP8 via Docker Compose
-nemotron/                    # placeholder
 CLAUDE.md                    # operator notes for Claude Code
 ```
 
@@ -79,7 +73,6 @@ curl http://<head-ip>:8000/v1/chat/completions \
 |---|---|---|---|---|---|
 | `qwen/launch-qwen-30b.sh` | Qwen3-30B-A3B-Thinking-2507-FP8 | 2 | 131072 | 0.70 | `deepseek_r1` reasoning, `hermes` tools |
 | `qwen/launch-qwen-122b.sh` | Qwen3.5-122B-A10B-FP8 | 2 | 65536 | 0.85 | Qwen3-Next hybrid MoE; ctx cut from 262k to fit KV+CUDA graphs |
-| `qwen/compose.yml` | Qwen3.6-35B-A3B-FP8 | 1 | 32768 | 0.70 | Single-Spark; `HF_TOKEN=hf_… docker compose up -d` |
 
 FP8 chosen over MXFP4 to avoid marlin/CUTLASS/FlashInfer-sinks issues on GB10 (SM121). Do not pass `--quantization` — auto-detected.
 
@@ -90,6 +83,7 @@ FP8 chosen over MXFP4 to avoid marlin/CUTLASS/FlashInfer-sinks issues on GB10 (S
 | `PRIMARY_IF` | `enp1s0f1np1` | Ray control + TP rendezvous (single IP) |
 | `DATA_IFS` | 4 ports comma-separated | UCX, NCCL sockets, Gloo, OMPI TCP |
 | `NCCL_IB_HCA` | `rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1` | RoCE HCAs for NCCL RDMA |
+| `UCX_NET_DEVICES` | same HCAs with `:1` port suffix | UCX RDMA transport (not netdev names) |
 | `NCCL_CROSS_NIC` | `1` | Allow cross-NIC pairing |
 | `TP_SOCKET_IFNAME` | `$PRIMARY_IF` | PyTorch TP needs a single IP, not the data plane list |
 | `RAY_memory_monitor_refresh_ms` | `0` | Disable Ray OOM killer (vLLM manages its own memory) |
@@ -113,7 +107,7 @@ docker stop $(docker ps --format '{{.Names}}' | grep '^node-')
 - **`No node-* container running`** from launch script. Head container not up yet, or `docker ps` filter misses it (custom name). Start head first.
 - **122B OOM on first inference.** Drop `--gpu-memory-utilization` from 0.85 to 0.80 in `launch-qwen-122b.sh`, or reduce `--max-model-len`.
 - **`WARNING: Using default MoE config ... GB10.json`.** Harmless. No hand-tuned MoE kernel config for GB10 yet; auto defaults work.
-- **Host freezes during inference.** `mem-watch.sh` running locally dies with the host. Run a laptop-side equivalent over SSH for freeze detection.
+- **Host freezes during inference.** A locally-run memory sampler dies with the host. Run a laptop-side `free`/`vmstat` poller over SSH for freeze detection.
 
 ## See also
 

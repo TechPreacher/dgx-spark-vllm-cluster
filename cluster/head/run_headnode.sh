@@ -1,9 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 # On Node 1, start head node
 
 # Get the IP address of the high-speed interface
 # Use the interface that shows "(Up)" from ibdev2netdev (enp1s0f0np0 or enp1s0f1np1)
 export MN_IF_NAME=enp1s0f1np1
-export VLLM_HOST_IP=$(ip -4 addr show $MN_IF_NAME | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+export VLLM_HOST_IP=$(ip -4 addr show "$MN_IF_NAME" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+if [[ -z "${VLLM_HOST_IP}" ]]; then
+  echo "Could not resolve IPv4 address for $MN_IF_NAME" >&2
+  exit 1
+fi
 export VLLM_IMAGE=nvcr.io/nvidia/vllm:25.11-py3
 
 echo "Using interface $MN_IF_NAME with IP $VLLM_HOST_IP"
