@@ -27,7 +27,7 @@ Both call `cluster/{head,worker}/run_cluster.sh`. The two copies are kept byte-i
 
 Optional verbose NCCL logging (off by default): prefix the launch with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET bash run_*node_2.sh`. Worker head IP override: `HEAD_NODE_IP=10.0.1.x bash run_workernode_2.sh`.
 
-Image: `nvcr.io/nvidia/vllm:26.05.post1-py3` (override per-bring-up with `VLLM_IMAGE=<tag>`; the bring-up scripts read it from the parent shell). HuggingFace cache is bind-mounted from `~/.cache/huggingface`. Single image for the whole cluster — Qwen and Nemotron share it.
+Image: `local/vllm-ray:26.05.post1` — a locally-built tag layered on top of `nvcr.io/nvidia/vllm:26.05.post1-py3` (NGC dropped Ray from the 26.05 vLLM image; `cluster/Dockerfile` adds it back). Build with `bash cluster/build-image.sh` on each node before first use; rebuild after bumping `BASE_IMAGE`. Override per-bring-up with `VLLM_IMAGE=<tag>`. HuggingFace cache is bind-mounted from `~/.cache/huggingface`. Single image for the whole cluster — Qwen and Nemotron share it.
 
 ## Model launch — what to know before editing
 

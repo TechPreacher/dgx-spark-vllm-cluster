@@ -20,6 +20,8 @@ Operator scripts for a 2-node NVIDIA DGX Spark cluster running distributed LLM i
 
 ```
 cluster/
+  Dockerfile                 # FROM nvcr.io/nvidia/vllm:26.05.post1-py3 + ray[default]
+  build-image.sh             # run once per node before first bring-up
   lib.sh                     # shared: load_env, find_ray_container (sourced by launchers + health)
   head/
     run_headnode_2.sh        # 4-port data plane, current default
@@ -40,6 +42,17 @@ nemotron/
   .env.example               # VLLM_API_KEY + HF_TOKEN template
 CLAUDE.md                    # operator notes for Claude Code
 ```
+
+## One-time per-node image build
+
+NGC dropped Ray from the `nvcr.io/nvidia/vllm:26.05*` images. `cluster/Dockerfile` layers `ray[default]` back on top. Build the resulting `local/vllm-ray:26.05.post1` tag on **both** nodes once before the first bring-up (and after any base-image bump):
+
+```bash
+bash cluster/build-image.sh    # on Node 1
+bash cluster/build-image.sh    # on Node 2
+```
+
+Override the base or tag via env: `BASE_IMAGE=nvcr.io/nvidia/vllm:26.06-py3 TAG=local/vllm-ray:26.06 bash cluster/build-image.sh`.
 
 ## Bring-up (order matters)
 

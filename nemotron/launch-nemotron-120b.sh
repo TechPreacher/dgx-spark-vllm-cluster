@@ -51,7 +51,8 @@ PP_SIZE="${PP_SIZE:-1}"
 PORT="${PORT:-8000}"
 
 # vLLM flag toggles. Defaults match the HF card's recommendation for the
-# upgraded cluster image (nvcr.io/nvidia/vllm:26.05.post1-py3). If you fall back to
+# upgraded cluster image (local/vllm-ray:26.05.post1, derived from
+# nvcr.io/nvidia/vllm:26.05.post1-py3 via cluster/Dockerfile). If you fall back to
 # an older image that rejects any of these, flip the corresponding env to 0
 # (or empty string) instead of editing this file.
 ENABLE_REASONING_PARSER="${ENABLE_REASONING_PARSER:-1}"

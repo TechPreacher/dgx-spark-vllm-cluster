@@ -19,7 +19,7 @@ fi
 export HEAD_NODE_IP="${HEAD_NODE_IP:-10.0.0.3}"
 
 # Set vLLM image
-export VLLM_IMAGE="${VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.05.post1-py3}"
+export VLLM_IMAGE="${VLLM_IMAGE:-local/vllm-ray:26.05.post1}"
 
 echo "Worker IP: $VLLM_HOST_IP, connecting to head node at: $HEAD_NODE_IP"
 

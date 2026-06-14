@@ -11,7 +11,7 @@ if [[ -z "${VLLM_HOST_IP}" ]]; then
   echo "Could not resolve IPv4 address for $MN_IF_NAME" >&2
   exit 1
 fi
-export VLLM_IMAGE="${VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.05.post1-py3}"
+export VLLM_IMAGE="${VLLM_IMAGE:-local/vllm-ray:26.05.post1}"
 
 echo "Using interface $MN_IF_NAME with IP $VLLM_HOST_IP"
 

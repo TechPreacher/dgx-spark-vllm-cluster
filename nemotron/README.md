@@ -46,9 +46,9 @@ ENABLE_EAGER=1        ./launch-nemotron-120b.sh   # disable CUDA graphs (stabili
 
 Other knobs: `MODEL_CKPT`, `SERVED_NAME`, `TP_SIZE`, `PP_SIZE`, `PORT`, `MAMBA_SSM_DTYPE`.
 
-### vLLM-version-dependent flags (defaults match `nvcr.io/nvidia/vllm:26.05.post1-py3`)
+### vLLM-version-dependent flags (defaults match `local/vllm-ray:26.05.post1`)
 
-The launcher turns the following flags ON by default, matching NVIDIA's HF model card for an `nvcr.io/nvidia/vllm:26.05.post1-py3` cluster image. If you fall back to an older image (e.g. `25.11-py3`) and one of them errors, opt out:
+The launcher turns the following flags ON by default, matching NVIDIA's HF model card for the `local/vllm-ray:26.05.post1` cluster image (built from `nvcr.io/nvidia/vllm:26.05.post1-py3` via `cluster/Dockerfile`). If you fall back to an older image (e.g. `25.11-py3`) and one of them errors, opt out:
 
 ```bash
 ENABLE_REASONING_PARSER=0  ./launch-nemotron-120b.sh   # drops --reasoning-parser-plugin + --reasoning-parser super_v3
