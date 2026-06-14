@@ -92,7 +92,7 @@ curl http://<head-ip>:8000/v1/chat/completions \
 |---|---|---|---|---|---|
 | `qwen/launch-qwen-30b.sh` | Qwen3-30B-A3B-Thinking-2507-FP8 | 2 | 131072 | 0.70 | `deepseek_r1` reasoning, `hermes` tools |
 | `qwen/launch-qwen-122b.sh` | Qwen3.5-122B-A10B-FP8 | 2 | 65536 | 0.85 | Qwen3-Next hybrid MoE; ctx cut from 262k to fit KV+CUDA graphs |
-| `nemotron/launch-nemotron-120b.sh` | NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | 2 | 524288 | 0.75 | Ray TP=2 across both Sparks; NVFP4 native FP4 on SM121; LatentMoE hybrid (Mamba-2 + MoE + Attention) |
+| `nemotron/launch-nemotron-120b.sh` | NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | 2 | 1048576 | 0.75 | Ray TP=2 across both Sparks; NVFP4 native FP4 on SM121; LatentMoE hybrid (Mamba-2 + MoE + Attention) |
 
 FP8 chosen over MXFP4 for the Qwen path (avoids marlin/CUTLASS/FlashInfer-sinks issues on GB10/SM121). The Nemotron path uses NVFP4 which is a natural fit for the GB10 FP4 tensor cores — do not switch its `--quantization` flag.
 
@@ -123,7 +123,7 @@ The Qwen path has no equivalent `cluster-env.sh` because its FP8 deployment requ
 
 Nemotron host-stability safeguards:
 - `--gpu-memory-utilization 0.75` (conservative; NVIDIA's example uses 0.9).
-- `--max-model-len 524288` (512k tokens; halfway between the 256k floor and the 1M model maximum). Push to `MAX_MODEL_LEN=1048576` once 512k proves stable, or drop to 262144 if KV pressure shows.
+- `--max-model-len 1048576` (1M tokens, model maximum). Verified stable on this hardware after a 512k checkpoint (host `MemAvailable` ~18 GB during inference at 512k). Drop to `MAX_MODEL_LEN=524288` or `262144` via env if you hit memory pressure under heavier concurrent load.
 - TP=2 across both Sparks roughly halves per-node weight memory vs. single-Spark.
 
 The Ray container is launched by `cluster/head/run_cluster.sh` **without** a `--memory` cgroup cap, so this launcher cannot add one. Host-side hardening on **both** Sparks is therefore not optional — the earlier `gpt-oss-120b` single-Spark crash that bricked sshd while ICMP still replied is the reason for the defenses listed below.
