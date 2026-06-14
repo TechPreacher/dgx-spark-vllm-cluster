@@ -145,7 +145,7 @@ docker exec -it \
       --moe-backend marlin \
       --dtype auto \
       --kv-cache-dtype fp8 \
-      --mamba-ssm-cache-dtype float16 \
+      --mamba-ssm-cache-dtype "${MAMBA_SSM_DTYPE:-auto}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --max-cudagraph-capture-size 128 \
