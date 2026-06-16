@@ -72,6 +72,23 @@ cd qwen
 
 Each cluster script blocks. Closing the terminal stops Ray on that node and tears down the cluster. The model-launch script uses `docker exec` against the head container (matched via `^node-[0-9]+$` from `docker ps`) and runs `vllm serve`. Ray dispatches TP shard 2 to Node 2 automatically.
 
+### Makefile shortcuts
+
+A top-level `Makefile` wraps the three bring-up commands. It sources `nemotron/cluster-env.sh` on both nodes so the cluster comes up Nemotron-ready (no-op for the Qwen path — `VLLM_FORWARD_VARS` passthrough does nothing when its target vars are unset at vLLM-serve time on the Qwen launchers).
+
+```bash
+# Node 1 (head)
+make head
+
+# Node 2 (worker)
+make worker
+
+# Node 1, new terminal, after both nodes are up
+make nemotron
+```
+
+Run `make help` to list targets. The Qwen launchers still live at `qwen/launch-qwen-*.sh` and are not wrapped by the Makefile.
+
 ## Verify
 
 ```bash
@@ -115,6 +132,14 @@ cd nemotron
 # Override knobs via env (see top of script):
 MAX_MODEL_LEN=1048576 GPU_MEM_UTIL=0.80 ENABLE_MTP=1 ./launch-nemotron-120b.sh   # push to 1M after 512k proves stable
 ENABLE_EAGER=1 ./launch-nemotron-120b.sh   # skip CUDA graph capture if memory spikes on first inference
+```
+
+Equivalent via the top-level Makefile (sources `nemotron/cluster-env.sh` automatically inside `make head` / `make worker`):
+
+```bash
+make head       # Node 1
+make worker     # Node 2
+make nemotron   # Node 1, new terminal
 ```
 
 The launcher refuses to run if the four `VLLM_NVFP4_*` / `VLLM_FLASHINFER_*` / `VLLM_USE_FLASHINFER_MOE_FP4` / `VLLM_ALLOW_LONG_MAX_MODEL_LEN` vars are missing from the head container's env — it prints the tear-down/bring-up steps and exits non-zero.
