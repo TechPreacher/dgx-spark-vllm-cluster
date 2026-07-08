@@ -3,14 +3,22 @@ set -euo pipefail
 
 # On Node 2, join as worker
 
-# All four ConnectX-7 ports are used as a data plane (~800 GbE aggregate).
-# Must match the names/order used in run_headnode_2.sh on Node 1.
-export PRIMARY_IF=enp1s0f1np1
-export DATA_IFS=enp1s0f0np0,enp1s0f1np1,enP2p1s0f0np0,enP2p1s0f1np1
-# RDMA device names (from `ibv_devinfo`) for UCX and NCCL. UCX wants RDMA
-# device:port (not netdev names); NCCL_IB_HCA uses the same set without :port.
-export RDMA_HCAS=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1
-export UCX_DEVS=rocep1s0f0:1,rocep1s0f1:1,roceP2p1s0f0:1,roceP2p1s0f1:1
+# The 2 physical 200G ConnectX-7 ports appear as 4 PCIe functions (f0/f1 halves
+# of each port). Cold boot brings all four up (full ~2x200G); a warm reboot
+# sheds the f1 half of each port. See select_up_dataplane in cluster/lib.sh.
+# Must match the control interface and selection logic used on Node 1.
+#
+# Control plane: pin to enp1s0f0np0 -- the f0 half that is up after *both* cold
+# and warm boots -- so Ray/VLLM_HOST_IP/MASTER_ADDR always have an interface to
+# bind to. Control traffic is coordination-only; it does not gate NCCL bandwidth.
+export PRIMARY_IF=enp1s0f0np0
+# Data plane: enumerate the CX7 links that currently have carrier and export
+# DATA_IFS / RDMA_HCAS / UCX_DEVS -- all four HCAs after a cold boot, only the
+# live ones after a warm reboot (never a down HCA, which can stall NCCL init).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib.sh
+source "${SCRIPT_DIR}/../lib.sh"
+select_up_dataplane
 
 export VLLM_HOST_IP=$(ip -4 addr show "$PRIMARY_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
 if [[ -z "${VLLM_HOST_IP}" ]]; then
@@ -18,9 +26,9 @@ if [[ -z "${VLLM_HOST_IP}" ]]; then
   exit 1
 fi
 
-# Head's primary IP (its enp1s0f1np1 under the new /24 plan).
-# Override via shell env if head moves: HEAD_NODE_IP=10.0.1.4 bash run_workernode_2.sh
-export HEAD_NODE_IP="${HEAD_NODE_IP:-10.0.1.3}"
+# Head's control IP (its enp1s0f0np0 address). Override via shell env if it moves:
+#   HEAD_NODE_IP=10.0.0.x bash run_workernode_2.sh
+export HEAD_NODE_IP="${HEAD_NODE_IP:-10.0.0.1}"
 
 export VLLM_IMAGE="${VLLM_IMAGE:-local/vllm-ray:26.05.post1}"
 

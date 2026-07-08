@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Bash scripts (no application code) that operate a 2-node NVIDIA DGX Spark (GB10 / SM121) Ray cluster running vLLM inside Docker for distributed LLM inference. The two Sparks are linked by 2× 200 GbE ConnectX-7 NICs (4 ports total, ~800 GbE aggregate data plane). Models tested: Qwen3-30B-A3B-Thinking-2507-FP8 and Qwen3.5-122B-A10B-FP8 across both nodes. A third launcher (`nemotron/launch-nemotron-120b.sh`) runs NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 across the same 2-node Ray cluster (TP=2) using native NVFP4 on SM121 FP4 tensor cores.
+Bash scripts (no application code) that operate a 2-node NVIDIA DGX Spark (GB10 / SM121) Ray cluster running vLLM inside Docker for distributed LLM inference. The two Sparks are linked by **2 physical 200 GbE ConnectX-7 QSFP ports**. Each physical port is exposed to the OS as two PCIe functions — an `f0` and `f1` half (dual x4-PCIe multi-host, because the GB10 SoC only gives x4 per device) — so `ibdev2netdev` shows 4 interfaces, but the hardware ceiling is **~2×200 = ~400 GbE, not 800**. A **cold boot** brings all four up; a **warm reboot sheds the `f1` half of each port** — the CX7 firmware latches an `insufficient power on the PCIe slot (27W)` state that only a full power cycle (AC removed, PCIe capacitors discharged) clears. The bring-up scripts pin the control plane to the always-up `f0` half and enumerate the data plane from carrier-up links (see below). Models tested: Qwen3-30B-A3B-Thinking-2507-FP8 and Qwen3.5-122B-A10B-FP8 across both nodes. A third launcher (`nemotron/launch-nemotron-120b.sh`) runs NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 across the same 2-node Ray cluster (TP=2) using native NVFP4 on SM121 FP4 tensor cores.
 
 ## Bring-up sequence (must run in order)
 
@@ -16,12 +16,11 @@ Each `run_*node_2.sh` script blocks (it `docker run`s with the Ray `--block` com
 
 `launch-qwen-*.sh` requires `qwen/.env` containing `VLLM_API_KEY=...` (gitignored — do not commit). They find the head container by matching `^node-[0-9]+$` from `docker ps`.
 
-## The two cluster variants
+## The cluster bring-up scripts
 
-- **`run_headnode_2.sh` / `run_workernode_2.sh` (current, in use):** 4-port data plane. `PRIMARY_IF=enp1s0f1np1` carries Ray control (single IP for `VLLM_HOST_IP` / `MASTER_ADDR`). `DATA_IFS=enp1s0f0np0,enp1s0f1np1,enP2p1s0f0np0,enP2p1s0f1np1` is exported to `UCX_NET_DEVICES`, `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, and `OMPI_MCA_btl_tcp_if_include`. NCCL is told the 4 RoCE HCAs via `NCCL_IB_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1` with `NCCL_CROSS_NIC=1`. `TP_SOCKET_IFNAME` is pinned to `PRIMARY_IF` so PyTorch TP setup uses the control IP.
-- **`run_headnode.sh` / `run_workernode.sh` (older, single-interface):** Only `enp1s0f1np1`, no IB env. Kept for fallback; do not edit when the 4-port path is in use.
+- **`run_headnode_2.sh` / `run_workernode_2.sh` (the only bring-up path):** dynamic multi-port data plane. `PRIMARY_IF=enp1s0f0np0` carries Ray control (single IP for `VLLM_HOST_IP` / `MASTER_ADDR`) — pinned to the `f0` half that is up after **both** cold and warm boots (the old `enp1s0f1np1` control IF is gone after a warm reboot). The data-plane vars `DATA_IFS`, `RDMA_HCAS`, `UCX_DEVS` are **built at launch time by `select_up_dataplane` (in `cluster/lib.sh`)** from the CX7 links that currently have carrier — all 4 RoCE HCAs after a cold boot, only the 2 live `f0` HCAs after a warm reboot — so NCCL is never handed a down HCA (which can stall collective init). Those feed `UCX_NET_DEVICES`, `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, `OMPI_MCA_btl_tcp_if_include`, and `NCCL_IB_HCA` (with `NCCL_CROSS_NIC=1`). `TP_SOCKET_IFNAME` is pinned to `PRIMARY_IF` so PyTorch TP setup uses the control IP. Control traffic is coordination-only and does not gate NCCL bandwidth, so full ~2×200G still requires a cold boot (all 4 halves up). Both nodes must be brought up on the matching `10.0.0.x` control subnet (head `10.0.0.1`; worker overrides with `HEAD_NODE_IP`).
 
-Both call `cluster/{head,worker}/run_cluster.sh`. The two copies are kept byte-identical (`--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1:-1` on both, `--shm-size 16g`). If you edit one, copy to the other — RoCE/IB device passthrough must exist on both sides or NCCL silently falls back to TCP and you lose the ~800 GbE data plane.
+Both call `cluster/{head,worker}/run_cluster.sh`. The two copies are kept byte-identical (`--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1:-1` on both, `--shm-size 16g`). If you edit one, copy to the other — RoCE/IB device passthrough must exist on both sides or NCCL silently falls back to TCP and you lose the RoCE data plane.
 
 `run_cluster.sh` positional args: `<image> <head_node_ip> --head|--worker <hf_cache_path> [extra docker args...]`. It extracts `VLLM_HOST_IP` from the extra args, names the container `node-${RANDOM}`, and traps `EXIT` to `docker stop && docker rm` on script exit. Caveat: Ctrl-C on the head terminal stops only the head container; the worker `ray start --block` keeps running attached to a now-dead head — `docker stop node-*` on the worker by hand to clean up.
 
@@ -39,7 +38,7 @@ FP8 (not MXFP4) is chosen for the Qwen path to avoid marlin/CUTLASS/FlashInfer-s
 
 ## Nemotron-3-Super-120B-A12B-NVFP4 (Ray TP=2 across both Sparks)
 
-`nemotron/launch-nemotron-120b.sh` follows the same pattern as the Qwen launchers: `docker exec` into the running `^node-[0-9]+$` head container and `vllm serve` with `--tensor-parallel-size 2`, letting Ray dispatch shard 2 to the worker over the 800 GbE data plane. It does NOT do a `docker run` of its own — the Ray cluster must already be up (`run_headnode_2.sh` + `run_workernode_2.sh`).
+`nemotron/launch-nemotron-120b.sh` follows the same pattern as the Qwen launchers: `docker exec` into the running `^node-[0-9]+$` head container and `vllm serve` with `--tensor-parallel-size 2`, letting Ray dispatch shard 2 to the worker over the RoCE data plane. It does NOT do a `docker run` of its own — the Ray cluster must already be up (`run_headnode_2.sh` + `run_workernode_2.sh`).
 
 The model is NVFP4-quantized (native GB10/SM121 FP4 tensor cores) and is a LatentMoE hybrid (Mamba-2 + MoE + Attention). `--mamba-ssm-cache-dtype float16` matters; the reasoning parser is a plugin file (`super_v3_reasoning_parser.py`) the launcher fetches **inside the container** at exec time and stores under `~/.cache/huggingface/` (which is bind-mounted, so it survives Ray container restarts). No host-side bind mount of the parser is needed.
 
