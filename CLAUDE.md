@@ -54,6 +54,10 @@ There is intentionally no `qwen/cluster-env.sh` — the Qwen FP8 path requires n
 
 Out-of-repo hardening that complements the launcher (apply on **both** Sparks): `OOMScoreAdjust=-1000` on sshd via `systemctl edit ssh`, `earlyoom` package installed and enabled, plus an external laptop-side watchdog that IPMI/PDU-cycles on repeated `/health` failures.
 
+## Docker GPU cgroup gotcha (applies to every model, both nodes)
+
+Docker must run with the **cgroupfs** cgroup driver on both Sparks — set once via `/etc/docker/daemon.json` = `{ "exec-opts": ["native.cgroupdriver=cgroupfs"] }`, then `sudo systemctl restart docker`. Verify with `docker info | grep -i "Cgroup Driver"` (must say `cgroupfs`). With the default **systemd** driver, any `systemctl daemon-reload` while a Ray container is running — including the automatic ones `snapd` fires to refresh snap-confine AppArmor profiles — makes systemd re-derive the container scope's device cgroup and **silently drop the nvidia-container-toolkit-injected `/dev/nvidia*` devices** (toolkit runs with `no-cgroups=false`). The device *nodes* stay mounted (`ls /dev/nvidia*` inside the container still works) but the container loses cgroup *permission* to use them. Symptom: a running model dies mid-flight with `CUDA error: operation not permitted` / `cudaErrorNotPermitted` (often first surfacing at CUDA-graph `capture_end`), and any subsequent launch fails earlier with `Failed to initialize NVML: Unknown Error` and `current platform None does not support ray`. Recovery once bitten: recreate the affected container (`make worker` / `make head`). `daemon.json` is read at every Docker start, so the fix survives reboots. This is unrelated to the warm-reboot link degradation above — it's a container-cgroup issue, not a fabric or GPU-hardware fault.
+
 ## Health / monitoring
 
 - `cluster/head/ray_inference_health.sh` — `ray status` in container, `curl :8000/health`, `nvidia-smi` on host + in container. Exits non-zero if no `node-*` container is running.
