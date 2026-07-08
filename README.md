@@ -5,8 +5,8 @@ Operator scripts for a 2-node NVIDIA DGX Spark cluster running distributed LLM i
 ## Hardware
 
 - 2× NVIDIA DGX Spark (GB10 / SM121, 128 GB unified memory each)
-- 2× 200 GbE ConnectX-7 NICs per node → 4 ports total, ~800 GbE aggregate data plane (RoCE)
-- One control-plane interface (`enp1s0f1np1`) on a `/24` carrying Ray + TP rendezvous
+- 2 physical 200 GbE ConnectX-7 QSFP ports per node, each exposed as two PCIe `f0`/`f1` halves (4 OS interfaces, ~2×200 = ~400 GbE ceiling; RoCE). Cold boot brings all 4 up; a warm reboot sheds the `f1` half of each port (PCIe 27 W power latch — cold-boot to recover)
+- Control plane pinned to the always-up `f0` half (`enp1s0f0np0`) on a `/24` carrying Ray + TP rendezvous; the data plane is enumerated from carrier-up links at bring-up (`select_up_dataplane`)
 - Head node primary IP: `10.0.1.3` (override via `HEAD_NODE_IP` env)
 
 ## Prerequisites
@@ -24,13 +24,11 @@ cluster/
   build-image.sh             # run once per node before first bring-up
   lib.sh                     # shared: load_env, find_ray_container (sourced by launchers + health)
   head/
-    run_headnode_2.sh        # 4-port data plane, current default
-    run_headnode.sh          # single-interface fallback
+    run_headnode_2.sh        # cluster bring-up (dynamic multi-port data plane)
     run_cluster.sh           # generic Ray+Docker launcher (head/worker)
     ray_inference_health.sh  # ray status + /health + nvidia-smi
   worker/
-    run_workernode_2.sh      # 4-port data plane, current default
-    run_workernode.sh        # single-interface fallback
+    run_workernode_2.sh      # cluster bring-up (dynamic multi-port data plane)
     run_cluster.sh           # byte-identical to head/run_cluster.sh
 qwen/
   launch-qwen-30b.sh         # Qwen3-30B-A3B-Thinking-2507-FP8 (TP=2, 131k ctx)
@@ -162,9 +160,9 @@ Host-side hardening recommended once, outside this repo:
 
 | Env var | Value | Why |
 |---|---|---|
-| `PRIMARY_IF` | `enp1s0f1np1` | Ray control + TP rendezvous (single IP) |
-| `DATA_IFS` | 4 ports comma-separated | UCX, NCCL sockets, Gloo, OMPI TCP |
-| `NCCL_IB_HCA` | `rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1` | RoCE HCAs for NCCL RDMA |
+| `PRIMARY_IF` | `enp1s0f0np0` | Ray control + TP rendezvous (single IP); the `f0` half that stays up after cold *and* warm boots |
+| `DATA_IFS` | carrier-up ports, comma-separated | UCX, NCCL sockets, Gloo, OMPI TCP; built at bring-up by `select_up_dataplane` (4 cold / 2 warm) |
+| `NCCL_IB_HCA` | carrier-up RoCE HCAs (`rocep1s0f0,roceP2p1s0f0` + the `f1` HCAs when up) | RoCE HCAs for NCCL RDMA |
 | `UCX_NET_DEVICES` | same HCAs with `:1` port suffix | UCX RDMA transport (not netdev names) |
 | `NCCL_CROSS_NIC` | `1` | Allow cross-NIC pairing |
 | `TP_SOCKET_IFNAME` | `$PRIMARY_IF` | PyTorch TP needs a single IP, not the data plane list |
