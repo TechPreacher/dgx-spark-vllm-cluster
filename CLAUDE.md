@@ -58,9 +58,28 @@ Out-of-repo hardening that complements the launcher (apply on **both** Sparks): 
 
 Docker must run with the **cgroupfs** cgroup driver on both Sparks — set once via `/etc/docker/daemon.json` = `{ "exec-opts": ["native.cgroupdriver=cgroupfs"] }`, then `sudo systemctl restart docker`. Verify with `docker info | grep -i "Cgroup Driver"` (must say `cgroupfs`). With the default **systemd** driver, any `systemctl daemon-reload` while a Ray container is running — including the automatic ones `snapd` fires to refresh snap-confine AppArmor profiles — makes systemd re-derive the container scope's device cgroup and **silently drop the nvidia-container-toolkit-injected `/dev/nvidia*` devices** (toolkit runs with `no-cgroups=false`). The device *nodes* stay mounted (`ls /dev/nvidia*` inside the container still works) but the container loses cgroup *permission* to use them. Symptom: a running model dies mid-flight with `CUDA error: operation not permitted` / `cudaErrorNotPermitted` (often first surfacing at CUDA-graph `capture_end`), and any subsequent launch fails earlier with `Failed to initialize NVML: Unknown Error` and `current platform None does not support ray`. Recovery once bitten: recreate the affected container (`make worker` / `make head`). `daemon.json` is read at every Docker start, so the fix survives reboots. This is unrelated to the warm-reboot link degradation above — it's a container-cgroup issue, not a fabric or GPU-hardware fault.
 
+## NVIDIA driver / kernel-module lockstep (applies to every model, both nodes)
+
+The Sparks have **no DKMS** — nothing rebuilds NVIDIA modules at boot. Kernel modules come only from prebuilt `linux-modules-nvidia-<branch>-<kernel>` packages. The kernel (src: `linux-nvidia`) and the driver (src: `nvidia-graphics-drivers-<branch>`) are **separate source packages on independent phased-update schedules**, and Ubuntu decides phasing **per-machine** (deterministic on machine-id). So one `apt upgrade` can pull a new kernel while holding the driver back — on one Spark but not the other. Reboot into that gap and the running kernel has no `nvidia.ko` at all.
+
+Symptom: `make head` dies in the container prestart hook with `nvidia-container-cli: initialization error: nvml error: driver not loaded`. On the host, `lsmod | grep nvidia` is empty, `/dev/nvidia*` is absent, and `nvidia-smi` reports it "couldn't communicate with the NVIDIA driver". This is **not** the cgroup issue above — that one revokes GPU access from a *running* container with the driver loaded fine; this is the host driver being absent entirely.
+
+Seen 2026-08-20: `apt upgrade -y` took `linux-image-nvidia-hwe-24.04` 6.17.0-1026.26 → 6.17.0-1029.29 but left `linux-modules-nvidia-580-open-nvidia-hwe-24.04` at 6.17.0-1026.26; reboot 14 minutes later ⇒ no GPU on `pulsar`. `magnetar`, same command same day, was in the phase group and came up fine — which is exactly why driver version must be compared across both nodes, not assumed.
+
+Recovery needs no reboot (the modules target the already-running kernel): `bash scripts/fix_nvidia.sh`, which installs the **metapackage** (not the pinpoint `...-<kernel>` package — the metapackage is what drifted, so upgrading it re-arms lockstep for the next kernel) and `modprobe`s. Expect it to move the whole NVIDIA userspace to a new driver version; that is correct, since the modules package hard-depends on a matching `nvidia-kernel-common-<branch>`, so module and userspace advance together by construction. It also rebuilds the *previous* kernel's modules against the new driver, keeping the old kernel bootable as a fallback.
+
+**Both Sparks must end up on the identical driver version** before bringing Ray up — don't leave a split-version pair across the RoCE fabric.
+
+Prevention is `scripts/preboot_check.sh`, run on each node before any reboot: it checks the kernel GRUB will boot **next**, not the running one. An apt-level mitigation (`APT::Get::Always-Include-Phased-Updates "true"`) would narrow the race but cannot close it — the archive can publish a kernel before its matching modules package exists — so the pre-reboot check stays the real defence.
+
 ## Health / monitoring
 
 - `cluster/head/ray_inference_health.sh` — `ray status` in container, `curl :8000/health`, `nvidia-smi` on host + in container. Exits non-zero if no `node-*` container is running.
+- `scripts/check_nvidia.sh` (`make check-nvidia`) — host NVIDIA driver health for **this** node; run it on each Spark. Exit codes are split so bring-up can gate on real breakage only: `0` healthy, `1` driver unusable now (blocks `make head`/`make worker`), `3` driver fine but metapackages drifted (next-reboot risk — warns, does not block), `2` the check itself could not run.
+- `scripts/preboot_check.sh` (`make preboot-check`) — run **before rebooting** a node: verifies the next-boot kernel has NVIDIA modules. `SAFE` / `UNSAFE TO REBOOT`.
+- `scripts/fix_nvidia.sh` (`make fix-nvidia`) — installs the matching modules metapackage and loads it. Shows an `apt-get -s` preview and prompts; `FIX_YES=1` to skip the prompt.
+- `scripts/nvidia_lib.sh` — shared helpers for the three above (driver-branch detection, next-boot kernel, `nvidia.ko` probe). Sourced, not executed. Branch is detected from installed packages, never hardcoded, so a 580 → 590 bump needs no edit.
+- `make head` / `make worker` run `check_nvidia.sh` as a preflight and abort on exit 1/2, turning the opaque `nvml error: driver not loaded` into a named cause plus the fix command. Bypass with `SKIP_PREFLIGHT=1`.
 
 ## Things that look risky and aren't (and vice-versa)
 

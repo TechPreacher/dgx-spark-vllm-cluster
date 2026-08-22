@@ -38,6 +38,14 @@ nemotron/
   launch-nemotron-120b.sh    # NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (Ray TP=2, NVFP4)
   cluster-env.sh             # NVFP4 runtime env -- MUST be sourced before cluster bring-up
   .env.example               # VLLM_API_KEY + HF_TOKEN template
+scripts/                     # per-node host checks; all operate on the node they run on
+  check_cluster.sh           # ibdev2netdev (netdev <-> RoCE HCA mapping)
+  check_docker.sh            # cgroup driver + GPU visible inside the Ray container
+  fix_docker.sh              # set cgroupfs driver, restart docker
+  nvidia_lib.sh              # shared: driver-branch detect, next-boot kernel, nvidia.ko probe
+  check_nvidia.sh            # host NVIDIA driver health (make check-nvidia)
+  preboot_check.sh           # before rebooting: will this node come back with a GPU?
+  fix_nvidia.sh              # install matching NVIDIA modules metapackage + load it
 CLAUDE.md                    # operator notes for Claude Code
 ```
 
@@ -84,6 +92,16 @@ make worker
 # Node 1, new terminal, after both nodes are up
 make nemotron
 ```
+
+Host-check targets, each operating on the node they are run from:
+
+```bash
+make check-nvidia    # is the NVIDIA driver healthy on this node?
+make preboot-check   # before rebooting this node: will it come back with a GPU?
+make fix-nvidia      # install NVIDIA modules matching this node's kernel
+```
+
+`make head` and `make worker` run `check-nvidia` as a preflight and refuse to start the cluster if the host driver is unusable — otherwise the failure surfaces only as an opaque `nvml error: driver not loaded` from Docker. Bypass with `SKIP_PREFLIGHT=1`.
 
 Run `make help` to list targets. The Qwen launchers still live at `qwen/launch-qwen-*.sh` and are not wrapped by the Makefile.
 
@@ -181,9 +199,38 @@ NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET bash run_headnode_2.sh
 docker stop $(docker ps --format '{{.Names}}' | grep '^node-')
 ```
 
+## Host maintenance: kernel upgrades and reboots
+
+The Sparks have **no DKMS**. NVIDIA kernel modules come only from prebuilt `linux-modules-nvidia-<branch>-<kernel>` packages, and the kernel (src: `linux-nvidia`) and the driver (src: `nvidia-graphics-drivers-<branch>`) are separate source packages on independent *phased-update* schedules — with phasing decided **per-machine**. A single `apt upgrade` can therefore pull a new kernel while holding the NVIDIA driver back, on one Spark but not the other. Reboot into that gap and the node comes up with no `nvidia.ko` at all: `nvidia-smi` dead, no `/dev/nvidia*`, and every GPU container failing in the prestart hook.
+
+Run on **each** node before rebooting it:
+
+```bash
+make preboot-check     # SAFE / UNSAFE TO REBOOT
+```
+
+`UNSAFE` means the kernel GRUB will boot **next** has no NVIDIA modules. Resync before rebooting:
+
+```bash
+make fix-nvidia        # installs the matching modules metapackage, then loads it
+```
+
+Recovery needs no reboot — the modules target the already-running kernel. Expect `fix-nvidia` to move the whole NVIDIA userspace to a new driver version; that is correct rather than collateral damage, since the modules package hard-depends on a matching `nvidia-kernel-common-<branch>`, so module and userspace advance together by construction.
+
+Health check at any time, per node:
+
+```bash
+make check-nvidia
+```
+
+Exit codes: `0` healthy · `1` driver unusable now (blocks `make head` / `make worker`) · `3` driver fine but the metapackages have drifted, so the **next** reboot is the risk (warns, does not block) · `2` the check itself could not run.
+
+**Both Sparks must report the same driver version** before Ray comes up — don't leave a split-version pair across the RoCE fabric.
+
 ## Troubleshooting
 
 - **Slow inter-node AllReduce / NCCL falls back to TCP.** Check that `/dev/infiniband/uverbs*` exists inside the worker container (`docker exec <node> ibv_devinfo`). Both `run_cluster.sh` copies must pass `--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1:-1`; they are kept byte-identical for this reason.
+- **`nvidia-container-cli: initialization error: nvml error: driver not loaded`** on `make head` / `make worker`. The host NVIDIA driver is not loaded, usually because a kernel upgrade landed a kernel with no matching modules package — see [Host maintenance](#host-maintenance-kernel-upgrades-and-reboots). Diagnose with `make check-nvidia`, repair with `make fix-nvidia`. Distinct from the cgroup-revocation failure, which shows `Failed to initialize NVML: Unknown Error` while the host driver is loaded fine.
 - **`No node-* container running`** from launch script. Head container not up yet, or `docker ps` filter misses it (custom name). Start head first.
 - **122B OOM on first inference.** Drop `--gpu-memory-utilization` from 0.85 to 0.80 in `launch-qwen-122b.sh`, or reduce `--max-model-len`.
 - **`WARNING: Using default MoE config ... GB10.json`.** Harmless. No hand-tuned MoE kernel config for GB10 yet; auto defaults work.
