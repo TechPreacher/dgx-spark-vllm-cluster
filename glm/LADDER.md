@@ -1,7 +1,7 @@
 # GLM-5.3-Flash context ladder — measurement log
 
-Status: **prepared, not yet run.** Blocked on the host-hardening prerequisites
-below, which need `sudo`. Fill each rung in as it is climbed; do not skip rungs.
+Status: **prerequisites satisfied 2026-09-28; rungs not yet run.** Fill each rung
+in as it is climbed; do not skip rungs.
 
 Headroom here is ~12.9 GiB/node against Nemotron's roughly double, and this
 cluster has a documented memory-starvation failure (`gpt-oss-120b`) that took
@@ -10,13 +10,14 @@ That is why the ladder exists and why the prerequisites are prerequisites.
 
 ## Prerequisites — run on BOTH nodes before rung 1
 
-As of 2026-09-28 **none of the first three are satisfied on either node**:
+Verified on both nodes 2026-09-28:
 
 | Check | pulsar | magnetar | Required |
 |---|---|---|---|
-| `earlyoom` | not installed | not installed | installed + enabled |
-| sshd `OOMScoreAdjust` | `0` | `0` | `-1000` |
-| `vm.swappiness` | `60` | `60` | `0` |
+| `earlyoom` | active + enabled | active + enabled | active + enabled |
+| earlyoom thresholds | see below | see below | must act on memory alone |
+| sshd listener `oom_score_adj` | `-1000` | `-1000` | `-1000` |
+| `vm.swappiness` | `0` (persisted) | `0` (persisted) | `0` |
 | docker cgroup driver | `cgroupfs` | `cgroupfs` | `cgroupfs` |
 | NVIDIA driver | 580.178.04 | 580.178.04 | identical both nodes |
 | `check_nvidia.sh` | exit 0 | exit 0 | exit 0 |
@@ -38,6 +39,44 @@ free -g
 `vm.swappiness=0` is the UVM-livelock defence on GB10 unified memory. Note one
 EXL3-based recipe recommends `180` plus zram instead; that is a different stack
 (EXL3/TR3, not NVFP4 weight-only) and is deliberately not adopted here.
+
+### earlyoom must be reconfigured, or it is inert here
+
+**earlyoom's stock thresholds are an AND across memory and swap:**
+
+```
+SIGTERM when mem <= 10.00% and swap <= 10.00%,
+SIGKILL when mem <=  5.00% and swap <=  5.00%
+```
+
+With `vm.swappiness=0` the 16 GB of swap stays essentially unused, so the swap
+condition is never met and **earlyoom never fires** under GPU-driven memory
+pressure. The two prerequisites fight each other: `swappiness=0` is precisely
+what disarms the stock earlyoom. Installing it and stopping there gives false
+comfort.
+
+Required on both nodes:
+
+```bash
+sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4 -s 100"/' /etc/default/earlyoom
+sudo systemctl restart earlyoom
+journalctl -u earlyoom -n 4 --no-pager     # expect: mem <= 4.00% and swap <= 100.00%
+```
+
+`-s 100` makes the swap side always true, reducing the AND to the memory
+condition. `-m 4` puts SIGTERM at 4% of 124608 MiB ≈ **4.9 GiB** and SIGKILL at
+2% ≈ 2.5 GiB (earlyoom halves the SIGTERM percentage for SIGKILL when the kill
+percentage is not given).
+
+4.9 GiB sits just above this document's 4 GB abort criterion, so earlyoom becomes
+the **automatic backstop for exactly that threshold**. The stock 10% (≈12.2 GiB)
+is too aggressive: it is high enough to kill a healthy run, and the Nemotron notes
+record normal operation at ~18 GB available.
+
+**Consequence for reading rung failures:** once configured this way, a rung that
+exhausts memory presents as **vLLM being SIGTERMed**, not as a hang or an
+unreachable host. Check `journalctl -u earlyoom` and `MemAvailable` before
+suspecting the model or the image.
 
 Also required: `glm/.env` with a real `HF_TOKEN` whose account has accepted terms
 for `LibertAIDAI/GLM-5.3-Flash-NVFP4`, and for `incoai/GLM-5.3-Flash-DFlash2` if

@@ -56,7 +56,26 @@ There is intentionally no `qwen/cluster-env.sh` — the Qwen FP8 path requires n
 
 **Host-stability context:** an earlier `gpt-oss-120b` single-Spark run starved the host of memory so badly that sshd became unreachable while ICMP still replied; recovery required a power cycle. With TP=2, per-node weight memory is roughly halved versus that single-Spark run, but the Ray container has no `--memory` cgroup cap (that's set by `run_cluster.sh` at container create time, not editable after the fact). Defences here are: `--gpu-memory-utilization 0.75` (vs NVIDIA's 0.9), `--max-model-len 1048576` (1M tokens, model maximum; verified stable after a 512k checkpoint with host `MemAvailable` ~18 GB during inference; overridable via `MAX_MODEL_LEN`), and an opt-in `ENABLE_EAGER=1` that skips CUDA graph capture if first-inference memory spikes are a concern. MTP speculative decoding is off by default; enable with `ENABLE_MTP=1`.
 
-Out-of-repo hardening that complements the launcher (apply on **both** Sparks): `OOMScoreAdjust=-1000` on sshd via `systemctl edit ssh`, `earlyoom` package installed and enabled, plus an external laptop-side watchdog that IPMI/PDU-cycles on repeated `/health` failures.
+Out-of-repo hardening that complements the launcher (apply on **both** Sparks): `OOMScoreAdjust=-1000` on sshd, `earlyoom` installed **and reconfigured** (see below), plus an external laptop-side watchdog that IPMI/PDU-cycles on repeated `/health` failures.
+
+**Installing earlyoom is not enough — stock earlyoom is inert on these hosts.** Its default thresholds are an **AND** across memory and swap: `SIGTERM when mem <= 10% and swap <= 10%`, `SIGKILL when mem <= 5% and swap <= 5%`. Because `vm.swappiness=0` (the UVM-livelock defence) keeps the 16 GB of swap essentially unused, the swap condition is never met and earlyoom never fires under GPU-driven memory pressure. The two defences disarm each other, and `systemctl is-active earlyoom` reporting `active` gives false comfort. Set on both nodes:
+
+```
+sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4 -s 100"/' /etc/default/earlyoom
+sudo systemctl restart earlyoom
+journalctl -u earlyoom -n 4 --no-pager     # expect: mem <= 4.00% and swap <= 100.00%
+```
+
+`-s 100` makes the swap side always true so the AND collapses to the memory condition; `-m 4` is SIGTERM at ~4.9 GiB and SIGKILL at ~2.5 GiB of 124608 MiB (earlyoom halves the SIGTERM percentage for SIGKILL when unspecified). Stock 10% (~12.2 GiB) is too aggressive — Nemotron's own notes record healthy operation at ~18 GB available. Once set, an out-of-memory rung presents as **vLLM being SIGTERMed**, not as a hang: check `journalctl -u earlyoom` before suspecting the model.
+
+**sshd protection on Ubuntu 24.04 here:** `ssh.socket` and `ssh.service` are both active, but the socket runs `Accept=no` and hands the fd to the single `ssh.service` listener — there are no per-connection `ssh@N.service` instances. So one drop-in on `ssh.service` is sufficient; no `ssh@.service` drop-in is needed. Verify with the **listener**, not `pgrep -o sshd` (which returns your own pre-existing session, whose `oom_score_adj` predates the change and reads `0` misleadingly):
+
+```
+for p in $(pgrep sshd); do printf '%s %s %s\n' "$p" "$(cat /proc/$p/oom_score_adj)" \
+  "$(awk -F/ '{print $NF}' /proc/$p/cgroup | head -1)"; done
+```
+
+The process in `ssh.service` must read `-1000`. New logins inherit it across the migration into their `session-N.scope`; existing sessions keep the old value until they reconnect.
 
 ## GLM-5.3-Flash-NVFP4 (Ray TP=2 across both Sparks)
 
