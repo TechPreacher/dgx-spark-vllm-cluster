@@ -1,4 +1,4 @@
-.PHONY: help head worker serve require-profile check-nvidia fix-nvidia preboot-check preflight test
+.PHONY: help head worker serve require-profile check-nvidia fix-nvidia preboot-check preflight test verify-glm-image
 
 SHELL := /bin/bash
 
@@ -12,6 +12,7 @@ help:
 	@echo "  make preboot-check - BEFORE rebooting THIS node: will it come up with a GPU?"
 	@echo "  make fix-nvidia    - install NVIDIA modules matching this node's kernel"
 	@echo "  make test          - run the repo's shell unit tests"
+	@echo "  make verify-glm-image - gate the GLM image: pinned base digest + unmoved pins"
 	@echo
 	@echo "  head/worker run check-nvidia first; bypass with SKIP_PREFLIGHT=1"
 	@echo
@@ -21,6 +22,7 @@ help:
 
 test:
 	@bash scripts/test_nvidia_lib.sh
+	@bash scripts/test_cluster_lib.sh
 
 check-nvidia:
 	@bash scripts/check_nvidia.sh
@@ -44,7 +46,7 @@ preflight:
 	else \
 		bash scripts/check_nvidia.sh; rc=$$?; \
 		if [ $$rc -eq 1 ] || [ $$rc -eq 2 ]; then \
-			echo "preflight: aborting bring-up. Bypass with: make $(MAKECMDGOALS) SKIP_PREFLIGHT=1" >&2; \
+			echo "preflight: aborting bring-up. Bypass with: make $(MAKECMDGOALS) PROFILE=$(PROFILE) SKIP_PREFLIGHT=1" >&2; \
 			exit 1; \
 		fi; \
 	fi
@@ -75,14 +77,21 @@ require-profile:
 		exit 1; \
 	fi
 
+# `unset VLLM_IMAGE` first: a profile that does not pin it would otherwise
+# inherit a leaked value from whatever profile the operator's shell sourced
+# earlier, and bring the cluster up on the wrong image with no error.
 head: require-profile preflight
-	cd cluster/head && . ../../$(PROFILE)/cluster-env.sh && bash run_headnode_2.sh
+	cd cluster/head && unset VLLM_IMAGE && . ../../$(PROFILE)/cluster-env.sh && bash run_headnode_2.sh
 
 worker: require-profile preflight
-	cd cluster/worker && . ../../$(PROFILE)/cluster-env.sh && bash run_workernode_2.sh
+	cd cluster/worker && unset VLLM_IMAGE && . ../../$(PROFILE)/cluster-env.sh && bash run_workernode_2.sh
 
 serve: require-profile
 	@case "$(PROFILE)" in \
 	  nemotron) cd nemotron && bash launch-nemotron-120b.sh ;; \
 	  glm)      cd glm && bash launch-glm53-flash.sh ;; \
+	  *) echo "No serve wiring for PROFILE=$(PROFILE). Add it to the serve target." >&2; exit 1 ;; \
 	esac
+
+verify-glm-image:
+	@bash glm/verify-image.sh

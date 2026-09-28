@@ -15,7 +15,11 @@ set -euo pipefail
 #
 # Run on each node after building. Usage: bash glm/verify-image.sh
 
-BASE_DIGEST="ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Single source of truth for the pinned base, shared with the launcher's
+# provenance assertion. Previously this digest was duplicated across five shipped
+# files and only this script failed loudly if one was missed on a bump.
+BASE_DIGEST="$(cat "${SCRIPT_DIR}/BASE_DIGEST")"
 LAYERED_TAG="${LAYERED_TAG:-local/vllm-ray-glm53:sm121-v11-dflash2}"
 
 # LC_ALL=C on BOTH sides is load-bearing, not cosmetic. `sort` runs inside the
@@ -82,7 +86,14 @@ if ! docker run --rm --entrypoint /bin/bash "${LAYERED_TAG}" -c 'ray --version' 
   echo "FAIL: ray CLI is not callable in ${LAYERED_TAG}." >&2
   exit 1
 fi
-echo "ray         OK ($(docker run --rm --entrypoint /bin/bash "${LAYERED_TAG}" -c 'ray --version' 2>&1 | head -n1))"
+RAY_VER=$(docker run --rm --entrypoint /bin/bash "${LAYERED_TAG}" -c 'ray --version' 2>&1 | head -n1)
+IMAGE_ID=$(docker image inspect "${LAYERED_TAG}" --format '{{.Id}}' 2>/dev/null | cut -c1-19)
+echo "ray         OK (${RAY_VER})"
+# ray[default] is deliberately unpinned in cluster/Dockerfile and each node builds
+# its own local tag, so a rebuild months apart can land different Ray versions on
+# the two Sparks -- the same split-pair hazard the repo forbids for driver
+# versions. Print both so the two nodes' outputs can be compared by eye.
+echo "compare     ${RAY_VER} / ${IMAGE_ID}   <- must match on the other Spark"
 
 echo
 echo "OK  ${LAYERED_TAG} is safe to use on $(hostname)."

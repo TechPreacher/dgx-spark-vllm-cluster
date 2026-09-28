@@ -71,6 +71,28 @@ check_eq "outage: running kernel ABI differs from metapackage ABI" \
         == "$(kernel_abi_from_pkg_version '6.17.0-1032.32')" ]] \
       && echo same || echo differ )"
 
+# --- kernel_abi_relation ------------------------------------------------------
+# The "kernel covered" row must distinguish two states that both look like an
+# ABI mismatch but mean opposite things:
+#   * metapkg ABI NEWER than running  = upgraded, not yet rebooted. SAFE, and
+#     the ordinary state after every apt upgrade. Must NOT warn -- warning here
+#     fires on every post-upgrade bring-up and re-creates the cry-wolf problem
+#     this row exists to fix.
+#   * metapkg ABI OLDER than running  = a pinpoint linux-image was installed
+#     ahead of the metapackage pair and booted. This is the 2026-09-27 outage.
+check_eq "relation: identical ABIs are covered" \
+  "same" "$(kernel_abi_relation 7.0.0-1019 7.0.0-1019)"
+check_eq "relation: metapkg newer than running = pending reboot (safe)" \
+  "pending-reboot" "$(kernel_abi_relation 7.0.0-1019 7.0.0-1020)"
+check_eq "relation: metapkg newer across series = pending reboot (safe)" \
+  "pending-reboot" "$(kernel_abi_relation 6.17.0-1032 7.0.0-1019)"
+check_eq "relation: metapkg OLDER than running = the 2026-09-27 exposure" \
+  "exposed" "$(kernel_abi_relation 7.0.0-1019 6.17.0-1032)"
+check_eq "relation: metapkg older within series = exposed" \
+  "exposed" "$(kernel_abi_relation 6.17.0-1032 6.17.0-1029)"
+check_rc_nonzero "relation: garbage input returns non-zero" \
+  kernel_abi_relation "junk" "7.0.0-1019"
+
 echo
 echo "  ${PASS} passed, ${FAIL} failed"
 echo

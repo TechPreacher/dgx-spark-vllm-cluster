@@ -106,9 +106,10 @@ Requires `glm/.env` (gitignored) — copy `glm/.env.example` and fill in
 explicitly warn against `glm` and `glm45`.
 
 `REASONING_PARSER` is a genuine open question — the checkpoint card says
-`deepseek_r1`, a 2-Spark recipe says `glm45`. A wrong parser does **not** error;
-it silently mis-splits `reasoning_content` from `content`. See
-[LADDER.md](LADDER.md) for the probe result.
+`deepseek_r1`, a 2-Spark recipe says `glm45`, and this image also registers
+`glm47`, the generation we already know is correct for *tool* calls. A wrong
+parser does **not** error; it silently mis-splits `reasoning_content` from
+`content`. All three are probed at ladder rung 1 — see [LADDER.md](LADDER.md).
 
 ## Operational invariants
 

@@ -129,6 +129,17 @@ time curl -s http://localhost:8000/v1/chat/completions \
 it silently mis-splits `reasoning_content` from `content`, so it can only be
 settled by observation.
 
+**Probe three candidates, not two.** This image registers 31 reasoning parsers
+including **`glm47`** as well as `glm45` and `deepseek_r1` (verified:
+`grep -noE '"(glm[0-9]*|deepseek_r1)"' vllm/reasoning/__init__.py` → lines 23,
+55, 59). The branch already concluded that `glm47` is the correct *tool-call*
+parser generation for this model and that `glm45` is explicitly wrong there, so
+excluding `glm47` from the reasoning probe would be an odd gap — even though the
+two parser families are independent. `deepseek_r1` stays the launcher default
+because the checkpoint card is the most authoritative single source, but treat
+`glm47` as a strong second hypothesis. All three are registered, so none of them
+fails at startup; they just quietly disagree about where the thinking goes.
+
 ```bash
 source glm/.env
 probe() {
@@ -139,7 +150,7 @@ probe() {
 print("reasoning_content:", (d.get("reasoning_content") or "<EMPTY>")[:120]);
 print("content:", (d.get("content") or "<EMPTY>")[:120])'
 }
-probe    # once with REASONING_PARSER=deepseek_r1, once with =glm45
+probe    # once each with REASONING_PARSER=deepseek_r1, =glm47, =glm45
 ```
 
 Correct parser: `reasoning_content` holds the step-by-step working, `content`

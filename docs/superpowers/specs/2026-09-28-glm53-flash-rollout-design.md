@@ -227,7 +227,7 @@ Serving flags, converged across the recipes:
 --max-model-len 262144
 --gpu-memory-utilization 0.85
 --kv-cache-dtype fp8
---kv-cache-memory 6442450944
+--kv-cache-memory-bytes 6442450944
 --block-size 2304
 --enforce-eager
 --tool-call-parser glm47 --enable-auto-tool-choice

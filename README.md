@@ -36,19 +36,24 @@ qwen/
   .env.example               # VLLM_API_KEY + HF_TOKEN template
 nemotron/
   launch-nemotron-120b.sh    # NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (Ray TP=2, NVFP4)
+  cluster-env.sh             # NVFP4 runtime env -- MUST be sourced before cluster bring-up
+  .env.example               # VLLM_API_KEY + HF_TOKEN template
 glm/
   launch-glm53-flash.sh      # GLM-5.3-Flash 320B-A18B (Ray TP=2, weight-only NVFP4)
-  cluster-env.sh             # forwarded env for the glm profile (ONE var -- see DISCOVERY.md)
+  cluster-env.sh             # forwarded env + VLLM_IMAGE for the glm profile
   verify-image.sh            # gate: the ray layer must not move the base image's SM121 pins
+  BASE_DIGEST                # the pinned base image digest (single source of truth)
+  README.md                  # knobs, licence, operational invariants
   DISCOVERY.md               # what was read off the image, and how
   LADDER.md                  # context-ladder measurement log
-  cluster-env.sh             # NVFP4 runtime env -- MUST be sourced before cluster bring-up
   .env.example               # VLLM_API_KEY + HF_TOKEN template
 scripts/                     # per-node host checks; all operate on the node they run on
   check_cluster.sh           # ibdev2netdev (netdev <-> RoCE HCA mapping)
   check_docker.sh            # cgroup driver + GPU visible inside the Ray container
   fix_docker.sh              # set cgroupfs driver, restart docker
   nvidia_lib.sh              # shared: driver-branch detect, next-boot kernel, nvidia.ko probe
+  test_nvidia_lib.sh         # unit tests for nvidia_lib's pure helpers (make test)
+  test_cluster_lib.sh        # unit tests for cluster/lib.sh's pure helpers (make test)
   check_nvidia.sh            # host NVIDIA driver health (make check-nvidia)
   preboot_check.sh           # before rebooting: will this node come back with a GPU?
   fix_nvidia.sh              # install matching NVIDIA modules metapackage + load it

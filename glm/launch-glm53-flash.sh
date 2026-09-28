@@ -73,11 +73,15 @@ NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-7}"
 # reasoning_content from content -- so this is probed at ladder rung 1.
 REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
 EXPECTED_IMAGE="${EXPECTED_IMAGE:-local/vllm-ray-glm53:sm121-v11-dflash2}"
+EXPECTED_BASE_DIGEST="${EXPECTED_BASE_DIGEST:-$(cat "${SCRIPT_DIR}/BASE_DIGEST")}"
 
 # Refuse to exceed the documented OOM ceiling, however the caller was invoked.
-if awk "BEGIN{exit !(${GPU_MEM_UTIL} > 0.85)}"; then
-  echo "ERROR: GPU_MEM_UTIL=${GPU_MEM_UTIL} exceeds 0.85." >&2
-  echo "0.90 is documented to OOM on GB10 with this checkpoint. Refusing." >&2
+# mem_util_within_ceiling (cluster/lib.sh) validates the format FIRST and fails
+# closed: the previous inline awk interpolated the value into program text, so
+# "inf", "0,85" and "abc" all passed the guard.
+if ! mem_util_within_ceiling "${GPU_MEM_UTIL}" 0.85; then
+  echo "ERROR: GPU_MEM_UTIL=${GPU_MEM_UTIL} is not an accepted value (must be a" >&2
+  echo "decimal <= 0.85). 0.90 is documented to OOM on GB10 with this checkpoint." >&2
   exit 1
 fi
 
@@ -102,6 +106,24 @@ EOF
   exit 1
 fi
 
+# Beyond the image NAME, assert the base digest recorded at build time. A tag can
+# be rebuilt from a different base; glm/verify-image.sh checks this at build time
+# but nothing stopped a later rebuild, and the label costs one inspect here.
+RUNNING_BASE=$(docker image inspect "${RUNNING_IMAGE}" \
+  --format '{{index .Config.Labels "glm.base.digest"}}' 2>/dev/null || true)
+if [[ "${RUNNING_BASE}" != "${EXPECTED_BASE_DIGEST}" ]]; then
+  cat >&2 <<EOF
+ERROR: ${RUNNING_IMAGE} was not built from the pinned base digest.
+  recorded: ${RUNNING_BASE:-<none>}
+  expected: ${EXPECTED_BASE_DIGEST}
+
+Rebuild it and re-run the gate on BOTH nodes:
+  BASE_IMAGE=${EXPECTED_BASE_DIGEST} TAG=${EXPECTED_IMAGE} bash cluster/build-image.sh
+  make verify-glm-image
+EOF
+  exit 1
+fi
+
 echo "Using container: ${VLLM_CONTAINER}  (${RUNNING_IMAGE})"
 echo "  model:             ${MODEL_CKPT}"
 echo "  TP:                ${TP_SIZE}"
@@ -120,6 +142,16 @@ echo "  port:              ${PORT}"
 # bring-up. Rank 1 on the worker will not have them either, and the run hangs in
 # a collective rather than erroring. Fail here with the fix instead.
 FORWARD_VARS=$(bash -c 'source '"${SCRIPT_DIR}"'/cluster-env.sh >/dev/null 2>&1; echo "${VLLM_FORWARD_VARS}"')
+# An empty list makes the loop below iterate zero times, so the guard would pass
+# silently -- which is what happened if cluster-env.sh was missing or errored.
+# The glm profile always has at least one forwarded var, so empty means broken.
+if [[ -z "${FORWARD_VARS// /}" ]]; then
+  echo "ERROR: could not read VLLM_FORWARD_VARS from ${SCRIPT_DIR}/cluster-env.sh." >&2
+  echo "Refusing to serve: without it the env guard below cannot check anything." >&2
+  exit 1
+fi
+# || true so a docker failure surfaces as a named cause rather than an
+# empty-handed `set -e` exit with no output at all.
 MISSING_VARS=$(docker exec "${VLLM_CONTAINER}" /bin/bash -c '
   set -u
   missing=""
@@ -127,7 +159,7 @@ MISSING_VARS=$(docker exec "${VLLM_CONTAINER}" /bin/bash -c '
     [[ -z "${!V:-}" ]] && missing="${missing} $V"
   done
   echo "${missing}"
-' | xargs)
+' 2>/dev/null | xargs) || true
 if [[ -n "${MISSING_VARS}" ]]; then
   cat >&2 <<EOF
 ERROR: Required GLM env vars are not set inside the Ray container:
@@ -143,30 +175,41 @@ EOF
   exit 1
 fi
 
-# Count GPUs rather than parsing the node list: `ray status` prints a
-# "Resources" block with a "0.0/2.0 GPU" usage line, and each Spark contributes
-# exactly one GB10. That line is far more stable across Ray versions than the
-# "Active:" node listing, whose formatting has changed between releases.
-ray_total_gpus() {
-  docker exec "${VLLM_CONTAINER}" /bin/bash -c \
-    "ray status 2>/dev/null | sed -n 's#.*/\([0-9.]*\) GPU\$#\1#p' | head -n1" 2>/dev/null \
-    | cut -d. -f1
-}
-
-echo -n "Waiting for Ray to report 2 GPUs"
-ALIVE=0
+# Readiness: BOTH two active nodes and two GPUs. Parsing is delegated to the
+# pure helpers in cluster/lib.sh (unit-tested by scripts/test_cluster_lib.sh).
+#
+# Two nodes AND two GPUs, not just two GPUs: if `make worker` is run on Node 1 by
+# mistake it joins itself, Ray reports 2 GPUs, and vLLM places both TP shards on
+# one Spark -- 181 GiB onto a single 128 GB host with no cgroup cap.
+echo -n "Waiting for Ray to report 2 nodes and 2 GPUs"
+NODES=0
+GPUS=0
 for _ in $(seq 1 60); do
-  ALIVE=$(ray_total_gpus)
-  ALIVE="${ALIVE:-0}"
-  [[ "${ALIVE}" -ge 2 ]] && { echo " -- ${ALIVE} GPUs"; break; }
+  # || true: a transient docker exec failure must not kill the poll silently.
+  STATUS=$(docker exec "${VLLM_CONTAINER}" ray status 2>/dev/null || true)
+  NODES=$(ray_node_count_from_status "${STATUS}")
+  GPUS=$(ray_gpu_total_from_status "${STATUS}")
+  if [[ "${NODES}" -ge 2 && "${GPUS}" -ge 2 ]]; then
+    echo " -- ${NODES} nodes, ${GPUS} GPUs"
+    break
+  fi
   echo -n "."
   sleep 2
 done
-if [[ "${ALIVE}" -lt 2 ]]; then
+if [[ "${NODES}" -lt 2 || "${GPUS}" -lt 2 ]]; then
   echo
-  echo "ERROR: Ray reports ${ALIVE} GPU(s), expected 2." >&2
-  echo "The worker has not joined. On Node 2:" >&2
-  echo "  source glm/cluster-env.sh && make worker PROFILE=glm" >&2
+  echo "ERROR: Ray reports ${NODES} node(s) and ${GPUS} GPU(s); need 2 and 2." >&2
+  if [[ "${NODES}" -ge 2 && "${GPUS}" -lt 2 ]]; then
+    echo "Two nodes but too few GPUs -- check the driver on the worker:" >&2
+    echo "  bash scripts/check_nvidia.sh      # on Node 2" >&2
+  elif [[ "${NODES}" -lt 2 && "${GPUS}" -ge 2 ]]; then
+    echo "Only one node is providing GPUs. Is the worker running on Node 1 by" >&2
+    echo "mistake? Both TP shards would land on one Spark. Tear down and restart" >&2
+    echo "the worker on Node 2." >&2
+  else
+    echo "The worker has not joined. On Node 2:" >&2
+    echo "  source glm/cluster-env.sh && make worker PROFILE=glm" >&2
+  fi
   exit 1
 fi
 
@@ -218,7 +261,7 @@ docker exec -it \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --kv-cache-dtype fp8 \
-      --kv-cache-memory "${KV_CACHE_MEMORY}" \
+      --kv-cache-memory-bytes "${KV_CACHE_MEMORY}" \
       --block-size "${BLOCK_SIZE}" \
       --max-num-seqs "${MAX_NUM_SEQS}" \
       --enable-auto-tool-choice \
