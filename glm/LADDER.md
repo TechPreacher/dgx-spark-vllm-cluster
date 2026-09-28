@@ -1,7 +1,8 @@
 # GLM-5.3-Flash context ladder — measurement log
 
-Status: **prerequisites satisfied 2026-09-28; rungs not yet run.** Fill each rung
-in as it is climbed; do not skip rungs.
+Status: **all prerequisites verified green on both nodes 2026-09-28; rungs not
+yet run.** The only remaining blocker for rung 1 is `glm/.env`. Fill each rung in
+as it is climbed; do not skip rungs.
 
 Headroom here is ~12.9 GiB/node against Nemotron's roughly double, and this
 cluster has a documented memory-starvation failure (`gpt-oss-120b`) that took
@@ -15,7 +16,8 @@ Verified on both nodes 2026-09-28:
 | Check | pulsar | magnetar | Required |
 |---|---|---|---|
 | `earlyoom` | active + enabled | active + enabled | active + enabled |
-| earlyoom thresholds | see below | see below | must act on memory alone |
+| earlyoom SIGTERM | `mem<=4%`, swap-independent | `mem<=4%`, swap-independent | swap-independent |
+| earlyoom SIGKILL | `mem<=2%`, swap-independent | `mem<=2%`, swap-independent | swap-independent |
 | sshd listener `oom_score_adj` | `-1000` | `-1000` | `-1000` |
 | `vm.swappiness` | `0` (persisted) | `0` (persisted) | `0` |
 | docker cgroup driver | `cgroupfs` | `cgroupfs` | `cgroupfs` |
@@ -60,8 +62,13 @@ Required on both nodes:
 ```bash
 sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4,2 -s 100,100"/' /etc/default/earlyoom
 sudo systemctl restart earlyoom
-journalctl -u earlyoom --no-pager -n 25 | grep -E 'SIGTERM|SIGKILL' | tail -2
+sleep 2   # journald lag: reading immediately after restart returns the PREVIOUS run's lines
+journalctl -u earlyoom --no-pager --since '-2min' | grep -E 'SIGTERM|SIGKILL' | tail -2
 ```
+
+The `--since` window plus the short wait matter: `journalctl -n N` straight after
+a restart can return the *previous* startup's thresholds, which reads exactly like
+the change having failed. Confirm by the timestamp, not just the values.
 
 `-s 100,100` makes the swap side always true for **both** signals, reducing each
 AND to its memory condition. `-m 4,2` puts SIGTERM at 4% of 124608 MiB ≈ **4.9
