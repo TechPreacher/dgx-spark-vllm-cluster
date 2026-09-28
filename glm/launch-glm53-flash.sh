@@ -72,6 +72,13 @@ NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-7}"
 # says glm45. A wrong parser does not error -- it silently mis-splits
 # reasoning_content from content -- so this is probed at ladder rung 1.
 REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
+# This vLLM build defaults distributed_executor_backend to "mp" (config/parallel.py
+# :917) and does NOT infer "ray" from a live Ray cluster the way the NGC 26.05
+# build behind the Nemotron path does. Without this flag, multiprocessing sees one
+# local GPU and refuses world size 2 outright:
+#   "World size (2) is larger than the number of available GPUs (1) in this node."
+# Accepted values: ray | mp | uni | external_launcher.
+DIST_BACKEND="${DIST_BACKEND:-ray}"
 EXPECTED_IMAGE="${EXPECTED_IMAGE:-local/vllm-ray-glm53:sm121-v11-dflash2}"
 EXPECTED_BASE_DIGEST="${EXPECTED_BASE_DIGEST:-$(cat "${SCRIPT_DIR}/BASE_DIGEST")}"
 
@@ -127,6 +134,7 @@ fi
 echo "Using container: ${VLLM_CONTAINER}  (${RUNNING_IMAGE})"
 echo "  model:             ${MODEL_CKPT}"
 echo "  TP:                ${TP_SIZE}"
+echo "  executor backend:  ${DIST_BACKEND}"
 echo "  max-model-len:     ${MAX_MODEL_LEN}"
 echo "  gpu-mem-util:      ${GPU_MEM_UTIL}"
 echo "  kv-cache-memory:   ${KV_CACHE_MEMORY}"
@@ -244,6 +252,7 @@ docker exec -it \
   -e BLOCK_SIZE="${BLOCK_SIZE}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
   -e TP_SIZE="${TP_SIZE}" \
+  -e DIST_BACKEND="${DIST_BACKEND}" \
   -e PORT="${PORT}" \
   -e EAGER_FLAG="${EAGER_FLAG}" \
   -e SPEC_FLAG="${SPEC_FLAG}" \
@@ -258,6 +267,7 @@ docker exec -it \
       --host 0.0.0.0 \
       --port "${PORT}" \
       --tensor-parallel-size "${TP_SIZE}" \
+      --distributed-executor-backend "${DIST_BACKEND}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --kv-cache-dtype fp8 \
