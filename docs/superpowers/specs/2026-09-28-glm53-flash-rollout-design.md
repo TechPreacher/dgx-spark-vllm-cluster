@@ -34,9 +34,9 @@ Rejected alternatives:
   RoCE enumeration and driver preflight, leaving two divergent bring-up paths on
   one cluster.
 
-## Prerequisite: the driver split (gating, blocks everything)
+## Prerequisite: the driver split (RESOLVED 2026-09-28)
 
-As of 2026-09-27 the two nodes are not serviceable:
+As of 2026-09-27 the two nodes were not serviceable:
 
 | | `pulsar` (head) | `magnetar` (worker) |
 |---|---|---|
@@ -57,6 +57,13 @@ tooling.
 **Exit criterion:** `scripts/check_nvidia.sh` exits 0 on both nodes *and* both
 report the identical driver version. Never bring Ray up across a split-version
 pair.
+
+**Outcome (2026-09-28):** `scripts/fix_nvidia.sh` on `pulsar` installed
+`linux-modules-nvidia-580-open-7.0.0-1019-nvidia`, moved the NVIDIA userspace
+580.173.02 → 580.178.04, re-armed both metapackages onto the 7.0 series, and
+rebuilt the 6.17.0-1032 modules against the new driver so the fallback kernel
+stays bootable. No reboot needed. Both nodes now report GB10 / 580.178.04 with
+metapackages at 7.0.0-1019.19~24.04.2+1. Prerequisite satisfied.
 
 ### Detector blind spot to close
 
@@ -160,10 +167,21 @@ make worker PROFILE=glm
 make serve PROFILE=glm
 ```
 
-`PROFILE` defaults to `nemotron`, so existing invocations keep working
-unchanged. The target sources `$(PROFILE)/cluster-env.sh` and takes
-`VLLM_IMAGE` from that profile. The `preflight` dependency is unchanged and
-still gates on `check_nvidia.sh`.
+The target sources `$(PROFILE)/cluster-env.sh` and takes `VLLM_IMAGE` from that
+profile. The `preflight` dependency is unchanged and still gates on
+`check_nvidia.sh`.
+
+**`PROFILE` has no default and is mandatory.** `make head` with no `PROFILE`
+must fail with a message naming the valid profiles, never fall back to one.
+Defaulting it would mean a bare `make head` silently brings the cluster up on
+the wrong image with the wrong forwarded env — and because the two profiles
+need *different* `VLLM_FORWARD_VARS`, that misconfiguration surfaces as a rank-1
+collective hang rather than an error. An explicit profile on every invocation is
+cheap; diagnosing a silent wrong-image bring-up is not.
+
+This is a breaking change to existing muscle memory: `make head` and
+`make worker` will start erroring until `PROFILE=nemotron` is supplied. That is
+intended.
 
 ### Bring-up order
 
