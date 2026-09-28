@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Launch LibertAIDAI/GLM-5.3-Flash-NVFP4 on the running Ray-clustered vLLM
+# container on Node 1. Ray dispatches shard 2 to Node 2 over the RoCE data
+# plane established by run_headnode_2.sh / run_workernode_2.sh.
+#
+# Does NOT docker run: the Ray cluster must already be up, brought up with
+# glm/cluster-env.sh sourced on BOTH nodes.
+#
+# Model: 320B total / 18B active MoE, natively multimodal, hybrid sparse +
+# linear attention with Manifold-Constrained Hyper-Connections. MIT.
+# Quantization: weight-only NVFP4-A16 -- the routed-expert FFN tensors (97% of
+# parameters) are NVFP4 (E2M1, FP8-E4M3 per-16-block scales); both attention
+# flavours, the vision tower, shared experts, routers, embeddings and the LM
+# head stay BF16. The checkpoint declares the MULTIMODAL architecture
+# (Glm5NextForConditionalGeneration), which is why --skip-mm-profiling matters
+# even for a text-only run: the vision tower is in the graph regardless.
+#
+# ---------------------------------------------------------------------------
+# Memory: tighter than Nemotron, which is why the defaults are what they are
+# ---------------------------------------------------------------------------
+#   weights        181 GiB    -> 90.5 GiB / node at TP=2
+#   budget @ 0.85  0.85 x 121.63 GiB = 103.4 GiB / node
+#   headroom       ~12.9 GiB / node for KV + activations + graphs
+#
+# Nemotron runs 1M context with roughly twice this headroom. Consequences:
+#   * GPU_MEM_UTIL 0.85 is a CEILING, not a starting point. 0.90 is documented
+#     to OOM on this hardware.
+#   * KV is fp8 with an explicit 6 GiB budget rather than "whatever is left".
+#   * ENABLE_EAGER defaults ON. CUDA graph capture is a memory spike, and
+#     capture_end is historically where the cgroup-permission failure first
+#     surfaced. Turn it off only after 262K is proven stable.
+#
+# Host-stability context: a gpt-oss-120b run once starved this host until sshd
+# was unreachable while ICMP still replied, and recovery needed a power cycle.
+# run_cluster.sh sets no --memory cgroup cap, so this launcher cannot add one.
+# Required hardening on BOTH nodes before running this:
+#   sudo systemctl edit ssh        # [Service] / OOMScoreAdjust=-1000
+#   sudo apt install earlyoom && sudo systemctl enable --now earlyoom
+# ---------------------------------------------------------------------------
+#
+# LICENCE: the DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) is
+# CC-BY-NC-ND-4.0 -- research / personal use only. Do not redistribute it and do
+# not bake it into a shared image. The target model itself is MIT. Leave
+# ENABLE_DFLASH2=0 for a licence-clean run.
+#
+# See glm/DISCOVERY.md for how every flag and env var below was established.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../cluster/lib.sh
+source "${SCRIPT_DIR}/../cluster/lib.sh"
+load_env "${SCRIPT_DIR}"
+: "${VLLM_API_KEY:?VLLM_API_KEY not set (expected in glm/.env -- copy glm/.env.example)}"
+: "${HF_TOKEN:?HF_TOKEN not set (expected in glm/.env -- copy glm/.env.example)}"
+
+# --- Overridable knobs -------------------------------------------------------
+MODEL_CKPT="${MODEL_CKPT:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
+SERVED_NAME="${SERVED_NAME:-zai-org/glm-5.3-flash}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-6442450944}"
+BLOCK_SIZE="${BLOCK_SIZE:-2304}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+TP_SIZE="${TP_SIZE:-2}"
+PORT="${PORT:-8000}"
+ENABLE_EAGER="${ENABLE_EAGER:-1}"
+ENABLE_DFLASH2="${ENABLE_DFLASH2:-0}"
+DRAFT_CKPT="${DRAFT_CKPT:-incoai/GLM-5.3-Flash-DFlash2}"
+NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-7}"
+# Recipes disagree: the checkpoint card says deepseek_r1, one 2-Spark recipe
+# says glm45. A wrong parser does not error -- it silently mis-splits
+# reasoning_content from content -- so this is probed at ladder rung 1.
+REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
+EXPECTED_IMAGE="${EXPECTED_IMAGE:-local/vllm-ray-glm53:sm121-v11-dflash2}"
+
+# Refuse to exceed the documented OOM ceiling, however the caller was invoked.
+if awk "BEGIN{exit !(${GPU_MEM_UTIL} > 0.85)}"; then
+  echo "ERROR: GPU_MEM_UTIL=${GPU_MEM_UTIL} exceeds 0.85." >&2
+  echo "0.90 is documented to OOM on GB10 with this checkpoint. Refusing." >&2
+  exit 1
+fi
+
+VLLM_CONTAINER=$(find_ray_container)
+
+# The cluster must be running the GLM image. Bringing it up on the Nemotron
+# image and then exec'ing this in fails deep inside vLLM on an unknown
+# architecture; catch it here with a cause instead.
+RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' "${VLLM_CONTAINER}")
+if [[ "${RUNNING_IMAGE}" != "${EXPECTED_IMAGE}" ]]; then
+  cat >&2 <<EOF
+ERROR: container ${VLLM_CONTAINER} is running the wrong image.
+  running:  ${RUNNING_IMAGE}
+  expected: ${EXPECTED_IMAGE}
+
+The Ray cluster was brought up on a different profile. Tear it down and bring
+it back up with the glm profile on BOTH nodes:
+
+  source glm/cluster-env.sh && make head   PROFILE=glm    # Node 1
+  source glm/cluster-env.sh && make worker PROFILE=glm    # Node 2
+EOF
+  exit 1
+fi
+
+echo "Using container: ${VLLM_CONTAINER}  (${RUNNING_IMAGE})"
+echo "  model:             ${MODEL_CKPT}"
+echo "  TP:                ${TP_SIZE}"
+echo "  max-model-len:     ${MAX_MODEL_LEN}"
+echo "  gpu-mem-util:      ${GPU_MEM_UTIL}"
+echo "  kv-cache-memory:   ${KV_CACHE_MEMORY}"
+echo "  block-size:        ${BLOCK_SIZE}"
+echo "  max-num-seqs:      ${MAX_NUM_SEQS}"
+echo "  enforce-eager:     ${ENABLE_EAGER}"
+echo "  DFlash2 spec:      ${ENABLE_DFLASH2}"
+echo "  reasoning parser:  ${REASONING_PARSER}"
+echo "  port:              ${PORT}"
+
+# Same guard as the Nemotron launcher: if the forwarded vars are absent from the
+# head container's env, the user did not source glm/cluster-env.sh before
+# bring-up. Rank 1 on the worker will not have them either, and the run hangs in
+# a collective rather than erroring. Fail here with the fix instead.
+FORWARD_VARS=$(bash -c 'source '"${SCRIPT_DIR}"'/cluster-env.sh >/dev/null 2>&1; echo "${VLLM_FORWARD_VARS}"')
+MISSING_VARS=$(docker exec "${VLLM_CONTAINER}" /bin/bash -c '
+  set -u
+  missing=""
+  for V in '"${FORWARD_VARS}"'; do
+    [[ -z "${!V:-}" ]] && missing="${missing} $V"
+  done
+  echo "${missing}"
+' | xargs)
+if [[ -n "${MISSING_VARS}" ]]; then
+  cat >&2 <<EOF
+ERROR: Required GLM env vars are not set inside the Ray container:
+  ${MISSING_VARS}
+
+These must be present at container START time on BOTH nodes; they cannot be
+added now via docker exec, because Ray-spawned rank-1 workers on the worker
+node would still be missing them. Tear the cluster down and bring it back up:
+
+  source glm/cluster-env.sh && make head   PROFILE=glm    # Node 1
+  source glm/cluster-env.sh && make worker PROFILE=glm    # Node 2
+EOF
+  exit 1
+fi
+
+# Count GPUs rather than parsing the node list: `ray status` prints a
+# "Resources" block with a "0.0/2.0 GPU" usage line, and each Spark contributes
+# exactly one GB10. That line is far more stable across Ray versions than the
+# "Active:" node listing, whose formatting has changed between releases.
+ray_total_gpus() {
+  docker exec "${VLLM_CONTAINER}" /bin/bash -c \
+    "ray status 2>/dev/null | sed -n 's#.*/\([0-9.]*\) GPU\$#\1#p' | head -n1" 2>/dev/null \
+    | cut -d. -f1
+}
+
+echo -n "Waiting for Ray to report 2 GPUs"
+ALIVE=0
+for _ in $(seq 1 60); do
+  ALIVE=$(ray_total_gpus)
+  ALIVE="${ALIVE:-0}"
+  [[ "${ALIVE}" -ge 2 ]] && { echo " -- ${ALIVE} GPUs"; break; }
+  echo -n "."
+  sleep 2
+done
+if [[ "${ALIVE}" -lt 2 ]]; then
+  echo
+  echo "ERROR: Ray reports ${ALIVE} GPU(s), expected 2." >&2
+  echo "The worker has not joined. On Node 2:" >&2
+  echo "  source glm/cluster-env.sh && make worker PROFILE=glm" >&2
+  exit 1
+fi
+
+EAGER_FLAG=""
+[[ "${ENABLE_EAGER}" == "1" ]] && EAGER_FLAG="--enforce-eager"
+
+# Method is "dflash" -- NOT "dflash2". The 2 lives in the drafter's architecture
+# (DFlash2DraftModel), not in vLLM's method string: config/speculative.py has
+# DFlashModelTypes = Literal["dflash"]. vLLM derives n_predict from the drafter's
+# block_size (8) when unset, and sets parallel_drafting=True for dflash.
+# See glm/DISCOVERY.md.
+SPEC_FLAG=""
+if [[ "${ENABLE_DFLASH2}" == "1" ]]; then
+  if [[ -n "${GLM_SPEC_CONFIG:-}" ]]; then
+    SPEC_FLAG="${GLM_SPEC_CONFIG}"
+  else
+    SPEC_FLAG=$(printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s}' \
+                  "${DRAFT_CKPT}" "${NUM_SPEC_TOKENS}")
+  fi
+  echo "  speculative:       ${SPEC_FLAG}"
+  echo "  NOTE: ${DRAFT_CKPT} is CC-BY-NC-ND-4.0 -- research use only."
+fi
+
+docker exec -it \
+  -e VLLM_API_KEY="${VLLM_API_KEY}" \
+  -e HF_TOKEN="${HF_TOKEN}" \
+  -e MODEL_CKPT="${MODEL_CKPT}" \
+  -e SERVED_NAME="${SERVED_NAME}" \
+  -e MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
+  -e GPU_MEM_UTIL="${GPU_MEM_UTIL}" \
+  -e KV_CACHE_MEMORY="${KV_CACHE_MEMORY}" \
+  -e BLOCK_SIZE="${BLOCK_SIZE}" \
+  -e MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
+  -e TP_SIZE="${TP_SIZE}" \
+  -e PORT="${PORT}" \
+  -e EAGER_FLAG="${EAGER_FLAG}" \
+  -e SPEC_FLAG="${SPEC_FLAG}" \
+  -e REASONING_PARSER="${REASONING_PARSER}" \
+  "${VLLM_CONTAINER}" /bin/bash -c '
+    set -euo pipefail
+    SPEC_ARGS=()
+    [[ -n "${SPEC_FLAG}" ]] && SPEC_ARGS+=(--speculative-config "${SPEC_FLAG}")
+    # shellcheck disable=SC2086
+    exec vllm serve "${MODEL_CKPT}" \
+      --served-model-name "${SERVED_NAME}" \
+      --host 0.0.0.0 \
+      --port "${PORT}" \
+      --tensor-parallel-size "${TP_SIZE}" \
+      --max-model-len "${MAX_MODEL_LEN}" \
+      --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+      --kv-cache-dtype fp8 \
+      --kv-cache-memory "${KV_CACHE_MEMORY}" \
+      --block-size "${BLOCK_SIZE}" \
+      --max-num-seqs "${MAX_NUM_SEQS}" \
+      --enable-auto-tool-choice \
+      --tool-call-parser glm47 \
+      --reasoning-parser "${REASONING_PARSER}" \
+      --skip-mm-profiling \
+      ${EAGER_FLAG} \
+      ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
+  '
