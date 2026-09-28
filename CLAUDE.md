@@ -61,12 +61,12 @@ Out-of-repo hardening that complements the launcher (apply on **both** Sparks): 
 **Installing earlyoom is not enough — stock earlyoom is inert on these hosts.** Its default thresholds are an **AND** across memory and swap: `SIGTERM when mem <= 10% and swap <= 10%`, `SIGKILL when mem <= 5% and swap <= 5%`. Because `vm.swappiness=0` (the UVM-livelock defence) keeps the 16 GB of swap essentially unused, the swap condition is never met and earlyoom never fires under GPU-driven memory pressure. The two defences disarm each other, and `systemctl is-active earlyoom` reporting `active` gives false comfort. Set on both nodes:
 
 ```
-sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4 -s 100"/' /etc/default/earlyoom
+sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4,2 -s 100,100"/' /etc/default/earlyoom
 sudo systemctl restart earlyoom
-journalctl -u earlyoom -n 4 --no-pager     # expect: mem <= 4.00% and swap <= 100.00%
+journalctl -u earlyoom --no-pager -n 25 | grep -E 'SIGTERM|SIGKILL' | tail -2
 ```
 
-`-s 100` makes the swap side always true so the AND collapses to the memory condition; `-m 4` is SIGTERM at ~4.9 GiB and SIGKILL at ~2.5 GiB of 124608 MiB (earlyoom halves the SIGTERM percentage for SIGKILL when unspecified). Stock 10% (~12.2 GiB) is too aggressive — Nemotron's own notes record healthy operation at ~18 GB available. Once set, an out-of-memory rung presents as **vLLM being SIGTERMed**, not as a hang: check `journalctl -u earlyoom` before suspecting the model.
+`-s 100,100` makes the swap side always true for **both** signals; `-m 4,2` is SIGTERM at ~4.9 GiB and SIGKILL at ~2.5 GiB of 124608 MiB. Give both kill percentages explicitly: with a bare `-m 4 -s 100` earlyoom halves *both*, yielding `SIGKILL when mem <= 2.00% and swap <= 50.00%`, which `swappiness=0` makes unreachable — SIGTERM would work but escalation would be disarmed for the one case it exists for, a process wedged in UVM livelock that ignores SIGTERM. Stock 10% (~12.2 GiB) is too aggressive — Nemotron's own notes record healthy operation at ~18 GB available. Once set, an out-of-memory rung presents as **vLLM being SIGTERMed**, not as a hang: check `journalctl -u earlyoom` before suspecting the model.
 
 **sshd protection on Ubuntu 24.04 here:** `ssh.socket` and `ssh.service` are both active, but the socket runs `Accept=no` and hands the fd to the single `ssh.service` listener — there are no per-connection `ssh@N.service` instances. So one drop-in on `ssh.service` is sufficient; no `ssh@.service` drop-in is needed. Verify with the **listener**, not `pgrep -o sshd` (which returns your own pre-existing session, whose `oom_score_adj` predates the change and reads `0` misleadingly):
 

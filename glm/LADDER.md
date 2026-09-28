@@ -58,15 +58,21 @@ comfort.
 Required on both nodes:
 
 ```bash
-sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4 -s 100"/' /etc/default/earlyoom
+sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4,2 -s 100,100"/' /etc/default/earlyoom
 sudo systemctl restart earlyoom
-journalctl -u earlyoom -n 4 --no-pager     # expect: mem <= 4.00% and swap <= 100.00%
+journalctl -u earlyoom --no-pager -n 25 | grep -E 'SIGTERM|SIGKILL' | tail -2
 ```
 
-`-s 100` makes the swap side always true, reducing the AND to the memory
-condition. `-m 4` puts SIGTERM at 4% of 124608 MiB ≈ **4.9 GiB** and SIGKILL at
-2% ≈ 2.5 GiB (earlyoom halves the SIGTERM percentage for SIGKILL when the kill
-percentage is not given).
+`-s 100,100` makes the swap side always true for **both** signals, reducing each
+AND to its memory condition. `-m 4,2` puts SIGTERM at 4% of 124608 MiB ≈ **4.9
+GiB** and SIGKILL at 2% ≈ **2.5 GiB**.
+
+Both kill percentages must be given explicitly. With a bare `-m 4 -s 100`,
+earlyoom halves *both* percentages for SIGKILL and you get `mem <= 2.00% and
+swap <= 50.00%` — and since `swappiness=0` keeps swap ~100% free, that SIGKILL
+can never fire. SIGTERM would still work, but the escalation path would be
+disarmed for precisely the case it exists for: a process wedged in UVM livelock
+that does not respond to SIGTERM.
 
 4.9 GiB sits just above this document's 4 GB abort criterion, so earlyoom becomes
 the **automatic backstop for exactly that threshold**. The stock 10% (≈12.2 GiB)
