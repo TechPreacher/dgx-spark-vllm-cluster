@@ -42,6 +42,11 @@ present "tool parser pinned to glm47"                  "--tool-call-parser glm47
 present "multimodal profiling skipped"                 "--skip-mm-profiling"
 present "fp8 kv cache"                                 "--kv-cache-dtype fp8"
 present "tensor parallel size is passed"               "--tensor-parallel-size"
+# The glm5next processor opens processor_config.json by path, so a repo id must
+# be resolved to a local snapshot dir before it reaches vllm serve.
+present "checkpoint resolved to a local dir"           "snapshot_download"
+present "serve is given the resolved dir, not the id"  'vllm serve "${MODEL_DIR}"'
+absent  "serve is not given the raw repo id"           'vllm serve "\$\{MODEL_CKPT\}"' 
 
 # The abbreviated form must not come back: it resolves today but breaks the moment
 # another --kv-cache-memory* option is registered, and it breaks at model launch.

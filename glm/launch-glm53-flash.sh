@@ -79,6 +79,14 @@ REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
 #   "World size (2) is larger than the number of available GPUs (1) in this node."
 # Accepted values: ray | mp | uni | external_launcher.
 DIST_BACKEND="${DIST_BACKEND:-ray}"
+# The patched image's Glm5NextProcessor.from_pretrained does a raw
+#   open(os.path.join(model_path, "processor_config.json"))
+# (transformers_utils/processors/glm5next.py:853) instead of resolving through
+# the Hub, so it ONLY works when --model is a local directory. Passed a repo id
+# it dies with FileNotFoundError on a file it has already downloaded into the
+# cache. So resolve the repo id to its snapshot directory before serving.
+# Set MODEL_PATH to skip resolution and use a directory directly.
+MODEL_PATH="${MODEL_PATH:-}"
 EXPECTED_IMAGE="${EXPECTED_IMAGE:-local/vllm-ray-glm53:sm121-v11-dflash2}"
 EXPECTED_BASE_DIGEST="${EXPECTED_BASE_DIGEST:-$(cat "${SCRIPT_DIR}/BASE_DIGEST")}"
 
@@ -245,6 +253,7 @@ docker exec -it \
   -e VLLM_API_KEY="${VLLM_API_KEY}" \
   -e HF_TOKEN="${HF_TOKEN}" \
   -e MODEL_CKPT="${MODEL_CKPT}" \
+  -e MODEL_PATH="${MODEL_PATH}" \
   -e SERVED_NAME="${SERVED_NAME}" \
   -e MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
   -e GPU_MEM_UTIL="${GPU_MEM_UTIL}" \
@@ -259,10 +268,29 @@ docker exec -it \
   -e REASONING_PARSER="${REASONING_PARSER}" \
   "${VLLM_CONTAINER}" /bin/bash -c '
     set -euo pipefail
+
+    # Resolve the checkpoint to a LOCAL directory (see MODEL_PATH note above).
+    # snapshot_download is resumable and writes into the bind-mounted HF cache,
+    # so an interrupted pull continues rather than restarting.
+    if [[ -n "${MODEL_PATH}" ]]; then
+      MODEL_DIR="${MODEL_PATH}"
+    elif [[ "${MODEL_CKPT}" == /* || "${MODEL_CKPT}" == .* ]]; then
+      MODEL_DIR="${MODEL_CKPT}"
+    else
+      echo "Resolving ${MODEL_CKPT} to a local snapshot (~181 GiB on first run)..."
+      MODEL_DIR=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('"'"'${MODEL_CKPT}'"'"'))")
+      echo "Model directory: ${MODEL_DIR}"
+    fi
+    if [[ ! -f "${MODEL_DIR}/processor_config.json" ]]; then
+      echo "ERROR: ${MODEL_DIR}/processor_config.json missing -- the glm5next" >&2
+      echo "processor reads it by path and will fail without it." >&2
+      exit 1
+    fi
+
     SPEC_ARGS=()
     [[ -n "${SPEC_FLAG}" ]] && SPEC_ARGS+=(--speculative-config "${SPEC_FLAG}")
     # shellcheck disable=SC2086
-    exec vllm serve "${MODEL_CKPT}" \
+    exec vllm serve "${MODEL_DIR}" \
       --served-model-name "${SERVED_NAME}" \
       --host 0.0.0.0 \
       --port "${PORT}" \
