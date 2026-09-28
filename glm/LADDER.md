@@ -91,9 +91,16 @@ exhausts memory presents as **vLLM being SIGTERMed**, not as a hang or an
 unreachable host. Check `journalctl -u earlyoom` and `MemAvailable` before
 suspecting the model or the image.
 
-Also required: `glm/.env` with a real `HF_TOKEN` whose account has accepted terms
-for `LibertAIDAI/GLM-5.3-Flash-NVFP4`, and for `incoai/GLM-5.3-Flash-DFlash2` if
-rung 4 is attempted.
+Also required: `glm/.env` with `HF_TOKEN` and `VLLM_API_KEY`.
+
+Neither model repo is gated (`gated: false` on both `LibertAIDAI/GLM-5.3-Flash-NVFP4`
+and `incoai/GLM-5.3-Flash-DFlash2`), so **there are no terms to accept** — any
+read-scoped token works, and it is only there for pull rate limits and the
+launcher's `:?` guard. Reuse the one in `nemotron/.env` if you like.
+
+The drafter's `cc-by-nc-nd-4.0` still binds **use** regardless: ungated means
+nothing blocks the download, not that the terms lapse. Non-commercial, no
+redistribution.
 
 First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 3.1 TB free — fits).

@@ -85,7 +85,8 @@ collective **hang**, not an error. The launcher refuses to start if the forwarde
 vars are missing from the head container.
 
 Requires `glm/.env` (gitignored) — copy `glm/.env.example` and fill in
-`HF_TOKEN` and `VLLM_API_KEY`.
+`HF_TOKEN` and `VLLM_API_KEY`. Neither model repo is gated, so no terms need
+accepting; `HF_TOKEN` is only for pull rate limits and the launcher's guard.
 
 ## Knobs
 
