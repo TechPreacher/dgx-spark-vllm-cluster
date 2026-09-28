@@ -8,3 +8,6 @@
 # Backups
 *.bak
 *~
+
+# superpowers scratch (plan ledgers, briefs, review packages)
+.superpowers/

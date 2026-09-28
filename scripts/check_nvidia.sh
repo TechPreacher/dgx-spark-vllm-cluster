@@ -107,6 +107,35 @@ elif [[ -z "${MOD_PKG_VER}" ]]; then
   warn "metapkg lockstep" "!!! modules metapackage not installed !!!"
 fi
 
+# --- 3b. does the modules metapackage cover the kernel we are RUNNING? -------
+# Section 3 compares the two metapackages to each other, which cannot see a
+# pinpoint linux-image-<ver>-nvidia installed ahead of the metapackage pair and
+# then booted. That is exactly the 2026-09-27 pulsar outage: both metapackages
+# agreed at 6.17.0-1032.32 while the running kernel was 7.0.0-1019 with no
+# nvidia.ko, and this script still printed "metapkg lockstep OK".
+RUN_ABI=$(kernel_abi_from_release "${KERNEL}" 2>/dev/null || true)
+META_ABI=""
+[[ -n "${MOD_PKG_VER}" ]] && META_ABI=$(kernel_abi_from_pkg_version "${MOD_PKG_VER}" 2>/dev/null || true)
+
+# Direction matters. A metapackage NEWER than the running kernel is the ordinary
+# "upgraded, not yet rebooted" state -- safe, and warning on it would fire after
+# every apt upgrade, re-creating the cry-wolf problem this row exists to fix.
+# Only an OLDER metapackage is the 2026-09-27 exposure.
+PINPOINT_AHEAD=0
+if [[ -n "${RUN_ABI}" && -n "${META_ABI}" ]]; then
+  case "$(kernel_abi_relation "${RUN_ABI}" "${META_ABI}" 2>/dev/null || echo unknown)" in
+    same)
+      row "kernel covered" "OK (${RUN_ABI})" ;;
+    pending-reboot)
+      row "kernel covered" "OK -- metapkg targets ${META_ABI}, reboot pending (safe)" ;;
+    exposed)
+      PINPOINT_AHEAD=1
+      warn "kernel covered" "!!! running ${RUN_ABI} but modules metapkg targets only ${META_ABI} !!!" ;;
+    *)
+      warn "kernel covered" "!!! could not compare ${RUN_ABI} with ${META_ABI} !!!" ;;
+  esac
+fi
+
 # --- verdict -----------------------------------------------------------------
 echo
 if [[ "${FAILED}" -ne 0 ]]; then
@@ -118,8 +147,14 @@ fi
 
 if [[ "${WARNED}" -ne 0 ]]; then
   echo "OK (with warning)  driver works now on $(hostname) -- ${MOD_VER}"
-  echo "  BUT the kernel and NVIDIA modules metapackages have drifted apart, so"
-  echo "  the next reboot may come up with no GPU. Nothing is broken today."
+  if [[ "${PINPOINT_AHEAD}" -eq 1 ]]; then
+    echo "  BUT a kernel NEWER than the modules metapackage is installed and running,"
+    echo "  so the metapackage is not what put nvidia.ko here -- a pinpoint package"
+    echo "  did. The next kernel upgrade can leave you with no GPU (2026-09-27)."
+  else
+    echo "  BUT the kernel and NVIDIA modules metapackages have drifted apart, so"
+    echo "  the next reboot may come up with no GPU. Nothing is broken today."
+  fi
   echo "  Before rebooting:  bash scripts/preboot_check.sh"
   echo "  To resync now:     bash scripts/fix_nvidia.sh"
   echo

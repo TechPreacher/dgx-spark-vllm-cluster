@@ -79,3 +79,55 @@ nvidia_ko_present_for() {
   hit=$(find "/lib/modules/${kernel}" -name 'nvidia.ko*' -print -quit 2>/dev/null)
   [[ -n "${hit}" ]]
 }
+
+# --- kernel ABI extraction ---------------------------------------------------
+# The 2026-09-27 outage was invisible to check_nvidia.sh's lockstep test: both
+# metapackages agreed with each other (6.17.0-1032.32) while the *running*
+# kernel was 7.0.0-1019, installed as a pinpoint linux-image-7.0.0-1019-nvidia
+# ahead of the metapackage pair. Comparing the metapackages only to each other
+# cannot see that. These two helpers extract a comparable kernel ABI from each
+# side so the running kernel can be checked against the metapackage directly.
+#
+# Kept pure (no dpkg, no filesystem) so scripts/test_nvidia_lib.sh can test them.
+
+# 7.0.0-1019-nvidia -> 7.0.0-1019
+kernel_abi_from_release() {
+  local abi
+  abi=$(sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+-[0-9]\+\)-.*$/\1/p' <<<"${1:-}")
+  [[ -n "${abi}" ]] || return 1
+  echo "${abi}"
+}
+
+# 7.0.0-1019.19~24.04.2+1 -> 7.0.0-1019   (the +N is a driver-rebuild suffix)
+# 6.17.0-1032.32          -> 6.17.0-1032
+kernel_abi_from_pkg_version() {
+  local abi
+  abi=$(sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+-[0-9]\+\)\..*$/\1/p' <<<"${1:-}")
+  [[ -n "${abi}" ]] || return 1
+  echo "${abi}"
+}
+
+# Classify the running kernel against the kernel the modules metapackage targets.
+# Echoes one of:
+#   same            ABIs match -- the metapackage covers what we are running
+#   pending-reboot  metapackage is NEWER: upgraded but not yet rebooted. SAFE.
+#                   This is the ordinary state after any apt upgrade, so it must
+#                   not be reported as drift -- doing so fires a warning on every
+#                   post-upgrade bring-up and re-creates, in the other direction,
+#                   the cry-wolf problem the "kernel covered" row exists to fix.
+#   exposed         metapackage is OLDER: a pinpoint linux-image-<ver>-nvidia was
+#                   installed ahead of the metapackage pair and booted. This is
+#                   the 2026-09-27 pulsar outage, and the case this row is for.
+# Returns non-zero if either ABI is unparseable.
+kernel_abi_relation() {
+  local run="${1:-}" meta="${2:-}"
+  [[ "${run}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || return 1
+  [[ "${meta}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || return 1
+  if [[ "${run}" == "${meta}" ]]; then
+    echo same
+  elif dpkg --compare-versions "${meta}" gt "${run}" 2>/dev/null; then
+    echo pending-reboot
+  else
+    echo exposed
+  fi
+}

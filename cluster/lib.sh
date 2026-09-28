@@ -28,7 +28,9 @@ find_ray_container() {
   local name
   name=$(docker ps --format '{{.Names}}' | grep -E '^node-[0-9]+$' | head -n1)
   if [[ -z "${name}" ]]; then
-    echo "No node-* container running on this host. Start the Ray cluster first (cluster/head/run_headnode_2.sh or cluster/worker/run_workernode_2.sh)." >&2
+    echo "No node-* container running on this host. Start the Ray cluster first, with a profile:" >&2
+    echo "  source <profile>/cluster-env.sh && make head   PROFILE=<profile>   # Node 1" >&2
+    echo "  source <profile>/cluster-env.sh && make worker PROFILE=<profile>   # Node 2" >&2
     exit 1
   fi
   echo "${name}"
@@ -77,4 +79,48 @@ select_up_dataplane() {
   UCX_DEVS="${up_ucx[*]}"
   export DATA_IFS RDMA_HCAS UCX_DEVS
   echo "ConnectX-7 data-plane links up: ${#up_ifs[@]}/4  (${DATA_IFS})"
+}
+
+# --- Ray readiness parsing ---------------------------------------------------
+# Pure helpers over `ray status` text, so scripts/test_cluster_lib.sh can cover
+# them without a live Ray cluster.
+#
+# Why not anchor on end-of-line: Ray appends "(N used of M reserved in placement
+# groups)" to the GPU usage line once a placement group holds the resource, and
+# vLLM creates one. An end-anchored parse returns empty there, which made the
+# launcher report "the worker has not joined" -- the wrong remedy -- on any
+# re-run after a failed serve.
+
+# Echo the TOTAL GPU count from `ray status` output (the denominator of the
+# "0.0/2.0 GPU" usage line). Echoes 0 when there is no GPU line.
+ray_gpu_total_from_status() {
+  local total
+  total=$(sed -n 's#.*/\([0-9][0-9]*\)\(\.[0-9]*\)\{0,1\} GPU.*#\1#p' <<<"${1:-}" | head -n1)
+  echo "${total:-0}"
+}
+
+# Echo the number of active nodes from `ray status` output.
+#
+# Counting GPUs alone cannot distinguish "2 nodes x 1 GB10" from "1 node x 2
+# GPUs". That matters: if the worker is started on Node 1 by mistake it joins
+# itself, Ray reports 2 GPUs, and vLLM places both TP shards on ONE Spark --
+# 181 GiB of weights onto a single 128 GB unified-memory host with no cgroup
+# cap. That is the gpt-oss-120b incident shape, so the node count is checked too.
+ray_node_count_from_status() {
+  grep -coE '^[[:space:]]*[0-9]+[[:space:]]+node_[0-9a-f]+' <<<"${1:-}" || true
+}
+
+# --- gpu-memory-utilization ceiling ------------------------------------------
+# rc 0 = within ceiling, rc 1 = refuse.
+#
+# Fails CLOSED on anything unparseable. The previous inline form interpolated the
+# value straight into awk program text, so "inf", "0,85" and "abc" all produced a
+# non-zero awk exit that read as "under the ceiling" -- the guard passed exactly
+# when it could not evaluate the input.
+mem_util_within_ceiling() {
+  local val="${1:-}" ceiling="${2:-0.85}"
+  # Strict decimal only: no signs, no exponents, no thousands separators, no
+  # shell/awk metacharacters. Validate BEFORE the value reaches awk.
+  [[ "${val}" =~ ^(0|1)(\.[0-9]+)?$|^\.[0-9]+$ ]] || return 1
+  awk -v v="${val}" -v c="${ceiling}" 'BEGIN{ exit (v+0 > c+0) ? 1 : 0 }'
 }

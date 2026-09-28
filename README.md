@@ -38,11 +38,22 @@ nemotron/
   launch-nemotron-120b.sh    # NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (Ray TP=2, NVFP4)
   cluster-env.sh             # NVFP4 runtime env -- MUST be sourced before cluster bring-up
   .env.example               # VLLM_API_KEY + HF_TOKEN template
+glm/
+  launch-glm53-flash.sh      # GLM-5.3-Flash 320B-A18B (Ray TP=2, weight-only NVFP4)
+  cluster-env.sh             # forwarded env + VLLM_IMAGE for the glm profile
+  verify-image.sh            # gate: the ray layer must not move the base image's SM121 pins
+  BASE_DIGEST                # the pinned base image digest (single source of truth)
+  README.md                  # knobs, licence, operational invariants
+  DISCOVERY.md               # what was read off the image, and how
+  LADDER.md                  # context-ladder measurement log
+  .env.example               # VLLM_API_KEY + HF_TOKEN template
 scripts/                     # per-node host checks; all operate on the node they run on
   check_cluster.sh           # ibdev2netdev (netdev <-> RoCE HCA mapping)
   check_docker.sh            # cgroup driver + GPU visible inside the Ray container
   fix_docker.sh              # set cgroupfs driver, restart docker
   nvidia_lib.sh              # shared: driver-branch detect, next-boot kernel, nvidia.ko probe
+  test_nvidia_lib.sh         # unit tests for nvidia_lib's pure helpers (make test)
+  test_cluster_lib.sh        # unit tests for cluster/lib.sh's pure helpers (make test)
   check_nvidia.sh            # host NVIDIA driver health (make check-nvidia)
   preboot_check.sh           # before rebooting: will this node come back with a GPU?
   fix_nvidia.sh              # install matching NVIDIA modules metapackage + load it
@@ -80,28 +91,29 @@ Each cluster script blocks. Closing the terminal stops Ray on that node and tear
 
 ### Makefile shortcuts
 
-A top-level `Makefile` wraps the three bring-up commands. It sources `nemotron/cluster-env.sh` on both nodes so the cluster comes up Nemotron-ready (no-op for the Qwen path — `VLLM_FORWARD_VARS` passthrough does nothing when its target vars are unset at vLLM-serve time on the Qwen launchers).
+A top-level `Makefile` wraps the bring-up commands. **`PROFILE` is required and has no default** — a bare `make head` fails naming the valid profiles (`nemotron`, `glm`). That is deliberate: the profiles carry different `VLLM_FORWARD_VARS` *and* different container images, so a default would let a bare invocation come up on the wrong image with the wrong env, which does not error — it hangs in an NCCL collective when rank 1 picks a different backend from rank 0.
 
 ```bash
 # Node 1 (head)
-make head
+source glm/cluster-env.sh && make head PROFILE=glm
 
 # Node 2 (worker)
-make worker
+source glm/cluster-env.sh && make worker PROFILE=glm
 
 # Node 1, new terminal, after both nodes are up
-make nemotron
+make serve PROFILE=glm
 ```
 
-Host-check targets, each operating on the node they are run from:
+Substitute `PROFILE=nemotron` (and `source nemotron/cluster-env.sh`) for the Nemotron path. The target sources `$(PROFILE)/cluster-env.sh` for you, which is also where `VLLM_IMAGE` comes from.
 
 ```bash
 make check-nvidia    # is the NVIDIA driver healthy on this node?
 make preboot-check   # before rebooting this node: will it come back with a GPU?
 make fix-nvidia      # install NVIDIA modules matching this node's kernel
+make test            # shell unit tests (nvidia_lib ABI helpers)
 ```
 
-`make head` and `make worker` run `check-nvidia` as a preflight and refuse to start the cluster if the host driver is unusable — otherwise the failure surfaces only as an opaque `nvml error: driver not loaded` from Docker. Bypass with `SKIP_PREFLIGHT=1`.
+`make head` and `make worker` check `PROFILE` first, then run `check-nvidia` as a preflight and refuse to start the cluster if the host driver is unusable (exit 1) or the check itself cannot run (exit 2). Metapackage drift (exit 3) warns but does not block. Bypass the driver preflight with `SKIP_PREFLIGHT=1`; `PROFILE` cannot be bypassed.
 
 Run `make help` to list targets. The Qwen launchers still live at `qwen/launch-qwen-*.sh` and are not wrapped by the Makefile.
 
@@ -126,6 +138,7 @@ curl http://<head-ip>:8000/v1/chat/completions \
 | `qwen/launch-qwen-30b.sh` | Qwen3-30B-A3B-Thinking-2507-FP8 | 2 | 131072 | 0.70 | `deepseek_r1` reasoning, `hermes` tools |
 | `qwen/launch-qwen-122b.sh` | Qwen3.5-122B-A10B-FP8 | 2 | 65536 | 0.85 | Qwen3-Next hybrid MoE; ctx cut from 262k to fit KV+CUDA graphs |
 | `nemotron/launch-nemotron-120b.sh` | NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | 2 | 1048576 | 0.75 | Ray TP=2 across both Sparks; NVFP4 native FP4 on SM121; LatentMoE hybrid (Mamba-2 + MoE + Attention) |
+| `glm/launch-glm53-flash.sh` | GLM-5.3-Flash 320B-A18B (`LibertAIDAI/GLM-5.3-Flash-NVFP4`) | 2 | 262144 | 0.85 (ceiling) | Ray TP=2, weight-only NVFP4, fp8 KV 6 GiB, own patched image |
 
 FP8 chosen over MXFP4 for the Qwen path (avoids marlin/CUTLASS/FlashInfer-sinks issues on GB10/SM121). The Nemotron path uses NVFP4 which is a natural fit for the GB10 FP4 tensor cores — do not switch its `--quantization` flag.
 
@@ -173,6 +186,28 @@ Host-side hardening recommended once, outside this repo:
 - `sudo systemctl edit ssh` → add `[Service]\nOOMScoreAdjust=-1000`
 - `sudo apt install earlyoom && sudo systemctl enable --now earlyoom`
 - External watchdog (laptop): `curl :8000/health` every 30 s; IPMI/PDU-cycle on N failures.
+
+GLM-5.3-Flash usage. Needs its **own** image — stock vLLM cannot run this model on GB10 at all (NoPE MLA, `qk_rope_head_dim=0`, against a sparse-attention kernel that assumes DeepSeek's `pe_dim=64`). Build once per node, then gate it:
+
+```bash
+BASE_IMAGE=ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6 \
+TAG=local/vllm-ray-glm53:sm121-v11-dflash2 bash cluster/build-image.sh
+bash glm/verify-image.sh
+```
+
+```bash
+source glm/cluster-env.sh && make head PROFILE=glm     # Node 1
+source glm/cluster-env.sh && make worker PROFILE=glm   # Node 2
+make serve PROFILE=glm                                 # Node 1, new terminal
+# glm/.env needs HF_TOKEN and VLLM_API_KEY
+# Override knobs via env (see glm/README.md):
+MAX_MODEL_LEN=131072 make serve PROFILE=glm            # climb the ladder, don't jump to 262K
+ENABLE_DFLASH2=1 make serve PROFILE=glm                # CC-BY-NC-ND drafter, research use only
+```
+
+Memory is the binding constraint: 181 GiB of weights → 90.5 GiB/node at TP=2, leaving **~12.9 GiB/node** for KV + activations — roughly half Nemotron's headroom. `GPU_MEM_UTIL` 0.85 is a hard ceiling and the launcher refuses more (0.90 is documented to OOM). `earlyoom` and sshd `OOMScoreAdjust=-1000` are **prerequisites** for this profile, not optional hardening, and `vm.swappiness=0` on both nodes.
+
+See **[glm/README.md](glm/README.md)** for the full knob table and operational invariants, **[glm/DISCOVERY.md](glm/DISCOVERY.md)** for how each flag was established from the image (three published recipe claims did not survive contact with it), and **[glm/LADDER.md](glm/LADDER.md)** for the context-ladder log.
 
 ## Networking knobs (passed into containers)
 
