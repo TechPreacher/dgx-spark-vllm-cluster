@@ -107,6 +107,24 @@ elif [[ -z "${MOD_PKG_VER}" ]]; then
   warn "metapkg lockstep" "!!! modules metapackage not installed !!!"
 fi
 
+# --- 3b. does the modules metapackage cover the kernel we are RUNNING? -------
+# Section 3 compares the two metapackages to each other, which cannot see a
+# pinpoint linux-image-<ver>-nvidia installed ahead of the metapackage pair and
+# then booted. That is exactly the 2026-09-27 pulsar outage: both metapackages
+# agreed at 6.17.0-1032.32 while the running kernel was 7.0.0-1019 with no
+# nvidia.ko, and this script still printed "metapkg lockstep OK".
+RUN_ABI=$(kernel_abi_from_release "${KERNEL}" 2>/dev/null || true)
+META_ABI=""
+[[ -n "${MOD_PKG_VER}" ]] && META_ABI=$(kernel_abi_from_pkg_version "${MOD_PKG_VER}" 2>/dev/null || true)
+
+if [[ -n "${RUN_ABI}" && -n "${META_ABI}" ]]; then
+  if [[ "${RUN_ABI}" == "${META_ABI}" ]]; then
+    row "kernel covered" "OK (${RUN_ABI})"
+  else
+    warn "kernel covered" "!!! running ${RUN_ABI} but modules metapkg targets ${META_ABI} !!!"
+  fi
+fi
+
 # --- verdict -----------------------------------------------------------------
 echo
 if [[ "${FAILED}" -ne 0 ]]; then
