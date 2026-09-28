@@ -16,8 +16,12 @@ BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/vllm:26.05.post1-py3}"
 TAG="${TAG:-local/vllm-ray:26.05.post1}"
 
 echo "Building ${TAG} FROM ${BASE_IMAGE}..."
+# Record what this was built FROM. glm/verify-image.sh gates on this label so a
+# moved upstream tag cannot silently substitute different kernels underneath a
+# digest-pinned base. Harmless for the Qwen/Nemotron image (records the NGC base).
 docker build \
   --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+  --label "glm.base.digest=${BASE_IMAGE}" \
   -t "${TAG}" \
   "${SCRIPT_DIR}"
 
