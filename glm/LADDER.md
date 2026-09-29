@@ -114,7 +114,7 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 | 2 | 131K | n/a | fp8, 6 GiB | off | KV math holds | — | — | — | _skipped — went straight to 262K_ |
 | 3 | 262K | n/a | fp8, 6 GiB | off | Target context | 6.6 GB idle / 6.1 GB under 60K load | 11.1 GB | ~14.7 | **PASS** |
 | 4 | 262K | n/a | fp8, **3 GiB** | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _ready to run_ |
-| 5 | 262K | n/a | fp8, 6 GiB | off, **CUTLASS MoE** | FP4 tensor cores vs marlin's weight-only 14.7 | | | | _building_ |
+| 5 | 262K | n/a | fp8, 6 GiB | off, **CUTLASS MoE** | FP4 tensor cores vs marlin's weight-only 14.7 | 6.1 GB under load | 10.6 GB | **14.4** | **PASS, but no speedup** |
 
 ### Abort criteria — any one, on either node
 
@@ -405,6 +405,47 @@ same way. The restart is not optional.
 
 Watch for: the engine reaching KV allocation without a compile phase (the module
 should load from cache in seconds), and `journalctl -u earlyoom` staying quiet.
+
+### Rung 5 result: works, and buys nothing for decode (2026-09-29)
+
+Engine start is clean once the module is precompiled -- no ninja output at all,
+`init engine took 126.10 s`, KV unchanged at 925,447 tokens / 3.53x.
+
+Measured on the running server, `flashinfer_cutlass`:
+
+| Measurement | CUTLASS | note |
+|---|---|---|
+| decode, single stream | **14.4 tok/s** | median of 3, `glm/bench.sh`; runs 14.35/14.38/14.38 |
+| prefill @ 60,028 tok | **~1,268 tok/s** | 47.3 s to first token |
+| decode, 8 concurrent | **57.0 tok/s aggregate** | 3.96x the single-stream rate |
+| MemAvailable under load | pulsar 6.1 GB / magnetar 10.6 GB | identical to marlin at rung 3 |
+
+**The honest comparison caveat:** marlin's recorded 14.7 tok/s came from a single
+ad-hoc curl (324 tokens in 22.0 s, prefill included), *not* from `glm/bench.sh`.
+So 14.4 vs 14.7 is not apples-to-apples and the ~2% gap is inside the
+methodological difference. What the data does support is the negative claim:
+**CUTLASS gives no decode speedup over marlin.** To state a signed difference
+you would have to re-measure marlin through `glm/bench.sh`, which costs a
+restart plus a ~9 minute load.
+
+**Why this is the expected outcome.** Single-stream decode here is
+memory-bandwidth bound, not compute bound: ~18B active params at ~0.5 byte each
+is roughly 9-10 GB of weights read per token against GB10's LPDDR5X. FP4 tensor
+cores cannot help a GEMM that is waiting on memory, which is exactly why the
+marlin "your GPU does not have native support for FP4 computation" warning never
+cost anything in practice. The 3.96x scaling to batch 8 is the same fact from
+the other side: extra streams reuse one weight read, so throughput scales almost
+linearly until compute finally matters.
+
+**Recommendation:** keep `marlin` as the default. It is prebuilt, needs no JIT,
+and performs the same. Reach for `flashinfer_cutlass` only if a future workload
+is prefill-heavy or runs high concurrency, where FP4 compute could start to pay.
+The infrastructure now exists either way and costs nothing to leave in place.
+
+**What the exercise was actually worth:** not throughput, but two durable image
+fixes (nvrtc header + `libnvrtc.so`), a persisted JIT cache, and a precompile
+path -- without which *any* FlashInfer JIT on this cluster fails, whatever the
+backend.
 
 ## Rung 4 notes: what to watch
 
