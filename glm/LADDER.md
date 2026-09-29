@@ -1,8 +1,9 @@
 # GLM-5.3-Flash context ladder — measurement log
 
-Status: **all prerequisites verified green on both nodes 2026-09-28; rungs not
-yet run.** The only remaining blocker for rung 1 is `glm/.env`. Fill each rung in
-as it is climbed; do not skip rungs.
+Status: **rungs 1 and 3 PASS on both nodes 2026-09-29 — the 262K target is
+served and verified.** Rung 4 (DFlash2) and rung 5 (CUTLASS MoE) are outstanding.
+Prerequisites were verified green 2026-09-28. Fill each rung in as it is climbed;
+do not skip rungs.
 
 Headroom here is ~12.9 GiB/node against Nemotron's roughly double, and this
 cluster has a documented memory-starvation failure (`gpt-oss-120b`) that took
@@ -113,6 +114,7 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 | 2 | 131K | n/a | fp8, 6 GiB | off | KV math holds | — | — | — | _skipped — went straight to 262K_ |
 | 3 | 262K | n/a | fp8, 6 GiB | off | Target context | 6.6 GB idle / 6.1 GB under 60K load | 11.1 GB | ~14.7 | **PASS** |
 | 4 | 262K | n/a | fp8, **3 GiB** | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _ready to run_ |
+| 5 | 262K | n/a | fp8, 6 GiB | off, **CUTLASS MoE** | FP4 tensor cores vs marlin's weight-only 14.7 | | | | _building_ |
 
 ### Abort criteria — any one, on either node
 
@@ -346,6 +348,53 @@ generation.
 The template's knobs are **`reasoning_effort`** (`low` / `high`, default `max`)
 and **`clear_thinking`** — *not* `enable_thinking`, which the recipes mention and
 which this template ignores entirely.
+
+## Rung 5 notes: CUTLASS MoE (FP4 tensor cores)
+
+marlin is weight-only: it decompresses NVFP4 weights and computes in higher
+precision, which is why it logs *"Your GPU does not have native support for FP4
+computation"*. That log line is correct rather than a fallback, but it does mean
+the GB10 FP4 tensor cores are idle. `flashinfer_cutlass` is the path that uses
+them, so rung 5 asks what that is worth against the 14.7 tok/s marlin baseline.
+
+**The first attempt failed, and the reason generalises.** With the nvrtc.h header
+link in place the compile starts, but vLLM only triggers it on the first MoE
+forward — during KV-cache profiling, with 88.63 GiB of weights already resident
+and ~10 GiB of host headroom. The module is **97 nvcc translation units**, and a
+single `cicc` on the worst of them measures **5284 MiB RSS**: 4.5x the ~1.17 GiB
+`cudafe++` figure that `MAX_JOBS=2` was sized against. earlyoom SIGTERMed the
+compiler at object 20 of 97, ~40 minutes into the build on top of a ~9 minute
+load, and the worker and engine died with it.
+
+Two fixes, both committed:
+
+1. `run_cluster.sh` now bind-mounts `~/.cache/flashinfer`. Before this the JIT
+   output lived in the container's writable layer and was destroyed with the
+   container, so every restart paid the build again — the earlier note claiming
+   the build was "cached into the bind-mounted cache" was simply wrong; only
+   `~/.cache/huggingface` was mounted.
+2. `glm/precompile-moe.sh` builds the module with **no model loaded**, where
+   ~110 GiB is free instead of ~10 GiB. That inverts the constraint: `MAX_JOBS`
+   can go to 10 rather than being throttled to 2.
+
+Run on each node (the JIT cache is per node, like the weights), then restart the
+cluster so the containers pick up the new mount:
+
+```bash
+bash glm/precompile-moe.sh                      # ~65 min at MAX_JOBS=10
+docker stop node-*                              # BOTH nodes
+source glm/cluster-env.sh && make head PROFILE=glm      # Node 1
+source glm/cluster-env.sh && make worker PROFILE=glm    # Node 2
+MAX_MODEL_LEN=262144 MOE_BACKEND=flashinfer_cutlass make serve PROFILE=glm
+LABEL=cutlass bash glm/bench.sh
+```
+
+A container started **before** the mount existed cannot see the precompiled
+module and will try to build it again at profiling time — i.e. it will fail the
+same way. The restart is not optional.
+
+Watch for: the engine reaching KV allocation without a compile phase (the module
+should load from cache in seconds), and `journalctl -u earlyoom` staying quiet.
 
 ## Rung 4 notes: what to watch
 
