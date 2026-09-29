@@ -79,6 +79,17 @@ REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
 #   "World size (2) is larger than the number of available GPUs (1) in this node."
 # Accepted values: ray | mp | uni | external_launcher.
 DIST_BACKEND="${DIST_BACKEND:-ray}"
+# MoE backend. The image auto-selects FLASHINFER_CUTLASS, which JIT-builds a
+# fused_moe_120 module at profile time -- and that build FAILS in this image:
+#   tensorrt_llm/deep_gemm/jit_utils.cuh:21:10: fatal error: nvrtc.h: No such file
+# nvrtc.h does exist, but only in the pip wheel's include dir
+# (dist-packages/nvidia/cu13/include/), which FlashInfer's nvcc line does not
+# add. cluster/Dockerfile now links it into /usr/local/cuda/include, so after a
+# rebuild flashinfer_cutlass becomes usable; until then marlin is prebuilt and
+# needs no JIT at all. marlin is also what the Nemotron NVFP4 path uses on SM121
+# and what the 2-Spark recipe specifies, so it is the conservative default.
+# Fallback order if marlin misbehaves: flashinfer_trtllm, then vllm_cutlass.
+MOE_BACKEND="${MOE_BACKEND:-marlin}"
 # The patched image's Glm5NextProcessor.from_pretrained does a raw
 #   open(os.path.join(model_path, "processor_config.json"))
 # (transformers_utils/processors/glm5next.py:853) instead of resolving through
@@ -143,6 +154,7 @@ echo "Using container: ${VLLM_CONTAINER}  (${RUNNING_IMAGE})"
 echo "  model:             ${MODEL_CKPT}"
 echo "  TP:                ${TP_SIZE}"
 echo "  executor backend:  ${DIST_BACKEND}"
+echo "  moe backend:       ${MOE_BACKEND}"
 echo "  max-model-len:     ${MAX_MODEL_LEN}"
 echo "  gpu-mem-util:      ${GPU_MEM_UTIL}"
 echo "  kv-cache-memory:   ${KV_CACHE_MEMORY}"
@@ -268,6 +280,7 @@ docker exec -it \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
   -e TP_SIZE="${TP_SIZE}" \
   -e DIST_BACKEND="${DIST_BACKEND}" \
+  -e MOE_BACKEND="${MOE_BACKEND}" \
   -e PORT="${PORT}" \
   -e EAGER_FLAG="${EAGER_FLAG}" \
   -e SPEC_FLAG="${SPEC_FLAG}" \
@@ -351,6 +364,7 @@ PY
       --port "${PORT}" \
       --tensor-parallel-size "${TP_SIZE}" \
       --distributed-executor-backend "${DIST_BACKEND}" \
+      --moe-backend "${MOE_BACKEND}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --kv-cache-dtype fp8 \

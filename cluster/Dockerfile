@@ -18,3 +18,26 @@ FROM ${BASE_IMAGE}
 # If you hit a Ray/vLLM mismatch, pin here (e.g. "ray[default]==2.40.0") and rebuild.
 RUN pip install --no-cache-dir "ray[default]" \
  && ray --version
+
+# Expose nvrtc.h where nvcc looks for it.
+#
+# FlashInfer JIT-builds its CUTLASS fused-MoE module at first use, and that build
+# includes <nvrtc.h> via tensorrt_llm/deep_gemm/jit_utils.cuh. The header is not
+# in /usr/local/cuda/include in these images -- it ships only inside the pip
+# wheel at dist-packages/nvidia/cu*/include/ -- and FlashInfer's nvcc command
+# line does not add that directory, so the build dies with
+#   jit_utils.cuh:21:10: fatal error: nvrtc.h: No such file or directory
+# ~9 minutes into a model load, at KV-cache profiling.
+#
+# Link every header from the wheel that CUDA's include dir is missing. Guarded so
+# it is a no-op on images that already have them (e.g. the NGC base).
+RUN set -eux; \
+    for d in /usr/local/lib/python3.*/dist-packages/nvidia/cu*/include; do \
+      [ -d "$d" ] || continue; \
+      for h in "$d"/*.h; do \
+        [ -e "$h" ] || continue; \
+        t="/usr/local/cuda/include/$(basename "$h")"; \
+        [ -e "$t" ] || ln -s "$h" "$t"; \
+      done; \
+    done; \
+    test -e /usr/local/cuda/include/nvrtc.h

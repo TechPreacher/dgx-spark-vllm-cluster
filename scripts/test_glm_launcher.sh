@@ -37,6 +37,9 @@ echo "glm launcher flag assertions"
 echo
 
 present "ray executor backend is passed explicitly" "--distributed-executor-backend"
+# The image's auto choice (flashinfer_cutlass) JIT-builds a module that cannot
+# compile here; marlin is prebuilt. Must be passed explicitly, not left to auto.
+present "moe backend is passed explicitly"             "--moe-backend"
 present "kv cache memory uses the registered flag name" "--kv-cache-memory-bytes"
 present "tool parser pinned to glm47"                  "--tool-call-parser glm47"
 present "multimodal profiling skipped"                 "--skip-mm-profiling"
