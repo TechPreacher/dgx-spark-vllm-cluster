@@ -13,10 +13,13 @@ returned, including three places the published recipes were wrong.
 
 The target model is MIT. The **DFlash2 drafter
 (`incoai/GLM-5.3-Flash-DFlash2`) is CC-BY-NC-ND-4.0**: research and personal
-use only, no redistribution, and never baked into a shared image. It is **off by
-default** (`ENABLE_DFLASH2=0`); a default run is licence-clean. If this
-deployment ever needs to serve commercial traffic, the drafter must go — the
-licence-clean alternative is MTP, which requires the
+use only, no redistribution, and never baked into a shared image.
+
+As of 2026-09-29 it is **ON by default** (`ENABLE_DFLASH2=1`), because rung 4
+measured a **2.8x decode speedup** (40.6 tok/s warm vs 14.4). **This means a
+default run is NOT licence-clean.** For a licence-clean run set
+`ENABLE_DFLASH2=0`. If this deployment ever needs to serve commercial traffic
+the drafter must go — the licence-clean alternative is MTP, which requires the
 `RedHatAI/GLM-5.3-Flash-NVFP4` checkpoint instead of this one.
 
 ## Why this profile needs its own image

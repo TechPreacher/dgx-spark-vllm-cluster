@@ -508,9 +508,13 @@ compile on first inference. Do not benchmark the first request.
 ### Licence reminder
 
 `incoai/GLM-5.3-Flash-DFlash2` is **CC-BY-NC-ND-4.0**: research/personal use
-only, never redistributed, never baked into a shared image. `ENABLE_DFLASH2`
-therefore stays **off by default** so a plain `make serve` is licence-clean --
-that is a deliberate choice, not an oversight, and it is why this 2.8x is opt-in.
+only, never redistributed, never baked into a shared image.
+
+`ENABLE_DFLASH2` now defaults to **1** (flipped 2026-09-29 on the maintainer's
+explicit call, given this cluster's research-only use), because a 2.8x speedup
+is too large to leave opt-in. **The consequence is that a plain `make serve` is
+no longer licence-clean.** Set `ENABLE_DFLASH2=0` for that, and before any
+commercial use switch to MTP (`RedHatAI/GLM-5.3-Flash-NVFP4`).
 
 ## Rung 4 notes: what to watch
 
@@ -542,6 +546,6 @@ Speculative config in use (from `glm/DISCOVERY.md` — method is `dflash`, not
 {"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}
 ```
 
-If rung 4 is stable and materially faster, flip `ENABLE_DFLASH2` to default `1`.
+Rung 4 was stable and materially faster, so `ENABLE_DFLASH2` now defaults to `1`.
 If not, leave it `0` and record why. Either way the drafter stays
 CC-BY-NC-ND-4.0 — research use only.

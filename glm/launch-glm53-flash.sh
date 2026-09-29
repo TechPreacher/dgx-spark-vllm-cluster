@@ -42,8 +42,14 @@ set -euo pipefail
 #
 # LICENCE: the DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) is
 # CC-BY-NC-ND-4.0 -- research / personal use only. Do not redistribute it and do
-# not bake it into a shared image. The target model itself is MIT. Leave
-# ENABLE_DFLASH2=0 for a licence-clean run.
+# not bake it into a shared image. The target model itself is MIT.
+#
+# This launcher defaults to ENABLE_DFLASH2=1 because rung 4 measured a 2.8x
+# decode speedup (40.6 tok/s warm vs 14.4), which is too large to leave opt-in
+# for this deployment's research use. THE DEFAULT THEREFORE PULLS IN A
+# NON-COMMERCIAL DEPENDENCY. Set ENABLE_DFLASH2=0 for a licence-clean run; do
+# that before serving any commercial traffic, or switch to MTP, which needs the
+# RedHatAI/GLM-5.3-Flash-NVFP4 checkpoint instead.
 #
 # See glm/DISCOVERY.md for how every flag and env var below was established.
 
@@ -68,7 +74,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 TP_SIZE="${TP_SIZE:-2}"
 PORT="${PORT:-8000}"
 ENABLE_EAGER="${ENABLE_EAGER:-1}"
-ENABLE_DFLASH2="${ENABLE_DFLASH2:-0}"
+ENABLE_DFLASH2="${ENABLE_DFLASH2:-1}"   # 2.8x decode; CC-BY-NC-ND drafter, see LICENCE above
 DRAFT_CKPT="${DRAFT_CKPT:-incoai/GLM-5.3-Flash-DFlash2}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-7}"
 # Recipes disagree: the checkpoint card says deepseek_r1, one 2-Spark recipe
@@ -285,8 +291,10 @@ EAGER_FLAG=""
 # on top of the 88.63 GiB target. Measured host headroom at 262K is only
 # ~1.2-1.7 GiB on pulsar, which is LESS than the drafter needs -- enabling
 # speculation at the default KV budget walks straight into earlyoom's SIGTERM.
-# So trade KV down: 3 GiB still yields roughly 460k tokens (~1.75x concurrency
-# at 262K) and frees 3 GiB, comfortably covering the drafter.
+# So trade KV down: 3 GiB frees enough to cover the drafter comfortably.
+# MEASURED 2026-09-29 (this estimate previously said ~460k tokens / ~1.75x, which
+# was wrong): 3 GiB yields 310,292 tokens = 1.18x concurrency at 262K, and pulsar
+# sat at 6.5 GB MemAvailable throughout -- no earlyoom activity.
 # Override KV_CACHE_MEMORY explicitly to opt out of this adjustment.
 if [[ "${ENABLE_DFLASH2}" == "1" && -z "${KV_CACHE_MEMORY_EXPLICIT:-}" && "${KV_CACHE_MEMORY}" == "6442450944" ]]; then
   KV_CACHE_MEMORY=3221225472
