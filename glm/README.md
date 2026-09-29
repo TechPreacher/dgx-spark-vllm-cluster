@@ -70,6 +70,29 @@ Nemotron runs 1M context with roughly twice this headroom. So:
 
 `PROFILE` is required and has no default.
 
+### Once per node (both Sparks)
+
+There is no shared filesystem, so anything written to disk must exist on **both**
+machines. Skipping any of these fails at engine start, not at launch:
+
+```bash
+BASE_IMAGE=ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6 \
+TAG=local/vllm-ray-glm53:sm121-v11-dflash2 bash cluster/build-image.sh
+bash glm/verify-image.sh          # gate: must pass
+
+bash glm/fetch-weights.sh                                     # ~181 GiB target model
+MODEL_CKPT=incoai/GLM-5.3-Flash-DFlash2 bash glm/fetch-weights.sh   # drafter, on by default
+
+bash glm/precompile-moe.sh        # ONLY if you intend to use MOE_BACKEND=flashinfer_cutlass
+```
+
+`precompile-moe.sh` is not needed for the default `marlin` backend. It is
+required before `flashinfer_cutlass`, which otherwise JIT-builds 97 translation
+units at KV-profiling time with the weights already resident and gets
+earlyoom-killed. See [LADDER.md](LADDER.md) rung 5.
+
+### Every start (three terminals)
+
 ```bash
 # Node 1 (head)
 source glm/cluster-env.sh && make head PROFILE=glm
@@ -79,6 +102,27 @@ source glm/cluster-env.sh && make worker PROFILE=glm
 
 # Node 1, new terminal
 make serve PROFILE=glm
+```
+
+That is the whole command — DFlash2 is on by default, so nothing extra is needed
+for the fast path. Expect roughly:
+
+| Phase | Duration |
+|---|---|
+| weight load | ~9 min (rank 0; rank 1 finishes in ~3) |
+| `init engine` | ~190 s with DFlash2, ~126 s without |
+| **first request** | **slow — this is warmup, not a fault** |
+
+The first generation after startup runs at ~7 tok/s while `mhc_fused_tilelang`
+and the xqa decode path compile; subsequent ones settle at ~40. Never benchmark
+the first request.
+
+Smoke test:
+
+```bash
+source glm/.env
+curl -s http://localhost:8000/health && echo " health OK"
+RUNS=3 LABEL=check bash glm/bench.sh     # expect ~40 tok/s warm
 ```
 
 `glm/cluster-env.sh` must be sourced on **both** nodes before bring-up. Ray does
@@ -97,11 +141,12 @@ accepting; `HF_TOKEN` is only for pull rate limits and the launcher's guard.
 |---|---|---|
 | `MAX_MODEL_LEN` | `262144` | Checkpoint's native max is higher; raising it needs the forwarded `VLLM_ALLOW_LONG_MAX_MODEL_LEN` |
 | `GPU_MEM_UTIL` | `0.85` | Hard ceiling; launcher refuses more |
-| `KV_CACHE_MEMORY` | `6442450944` | 6 GiB, fp8 |
+| `KV_CACHE_MEMORY` | `6442450944` | 6 GiB, fp8. **Auto-traded down to 3 GiB when DFlash2 is on** (i.e. by default) to make room for the 2.34 GB drafter; setting this explicitly opts out. Measured: 3 GiB = 310,292 tokens, 1.18x concurrency at 262K |
 | `BLOCK_SIZE` | `2304` | |
 | `MAX_NUM_SEQS` | `8` | |
+| `MOE_BACKEND` | `marlin` | `flashinfer_cutlass` measured no faster and needs `precompile-moe.sh` first — see LADDER rung 5 |
 | `ENABLE_EAGER` | `1` | `0` attempts CUDA graph capture |
-| `ENABLE_DFLASH2` | `0` | `1` enables the CC-BY-NC-ND drafter |
+| `ENABLE_DFLASH2` | **`1`** | On by default since 2026-09-29: 2.8x decode (40.6 vs 14.4 tok/s). Pulls in the **CC-BY-NC-ND** drafter — set `0` for a licence-clean run |
 | `NUM_SPEC_TOKENS` | `7` | Against the drafter's `block_size: 8` |
 | `REASONING_PARSER` | `deepseek_r1` | See below |
 | `MODEL_CKPT` / `SERVED_NAME` / `PORT` / `TP_SIZE` | — | |
@@ -114,11 +159,15 @@ is what makes a run text-only — omitting the flag does not. `--skip-mm-profili
 only skips the engine's profiling pass; the API server still warms the vision
 processor afterwards, which is expensive enough to trigger earlyoom here.
 
-`REASONING_PARSER` is a genuine open question — the checkpoint card says
-`deepseek_r1`, a 2-Spark recipe says `glm45`, and this image also registers
-`glm47`, the generation we already know is correct for *tool* calls. A wrong
-parser does **not** error; it silently mis-splits `reasoning_content` from
-`content`. All three are probed at ladder rung 1 — see [LADDER.md](LADDER.md).
+`REASONING_PARSER` was an open question and is now **settled as a negative
+result**: no parser in this build surfaces the reasoning. `deepseek_r1` and
+`glm47` behave identically — `content` is always correct and never contaminated,
+and `reasoning_content` is always `None`. That holds across
+`chat_template_kwargs` variants and streaming, so it is a defect in this day-0
+build's adapter path, not a misconfiguration. It costs nothing for ordinary use;
+the chain-of-thought is simply discarded. To see it, call `/v1/completions` with
+the rendered prompt. Do not spend restarts on parser names — see
+[LADDER.md](LADDER.md).
 
 ## Operational invariants
 
