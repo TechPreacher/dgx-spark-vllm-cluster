@@ -157,6 +157,9 @@ echo "  port:              ${PORT}"
 # head container's env, the user did not source glm/cluster-env.sh before
 # bring-up. Rank 1 on the worker will not have them either, and the run hangs in
 # a collective rather than erroring. Fail here with the fix instead.
+# Read back what the container actually has, for the banner above -- MAX_JOBS
+# only helps if it reached the container at start time.
+MAX_JOBS_SEEN=$(docker exec "${VLLM_CONTAINER}" printenv MAX_JOBS 2>/dev/null || echo "<unset>")
 FORWARD_VARS=$(bash -c 'source '"${SCRIPT_DIR}"'/cluster-env.sh >/dev/null 2>&1; echo "${VLLM_FORWARD_VARS}"')
 # An empty list makes the loop below iterate zero times, so the guard would pass
 # silently -- which is what happened if cluster-env.sh was missing or errored.
@@ -176,6 +179,8 @@ MISSING_VARS=$(docker exec "${VLLM_CONTAINER}" /bin/bash -c '
   done
   echo "${missing}"
 ' 2>/dev/null | xargs) || true
+echo "  MAX_JOBS in ctr:   ${MAX_JOBS_SEEN}"
+
 if [[ -n "${MISSING_VARS}" ]]; then
   cat >&2 <<EOF
 ERROR: Required GLM env vars are not set inside the Ray container:

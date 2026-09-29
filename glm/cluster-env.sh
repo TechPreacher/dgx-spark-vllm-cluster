@@ -56,6 +56,27 @@ export VLLM_IMAGE=local/vllm-ray-glm53:sm121-v11-dflash2
 # failure without it on rank 1 only is a hang, not an error.
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
+# ---------------------------------------------------------------------------
+# MAX_JOBS: cap JIT compile fan-out, or the run dies AFTER a successful load
+# ---------------------------------------------------------------------------
+# MAX_JOBS defaults to the CPU count (20 on a Spark) and controls ninja's
+# parallel workers in FlashInfer's JIT (flashinfer/jit/cpp_ext.py:_get_num_workers).
+# Each worker spawns a `cudafe++` at ~1.17 GiB RSS, so the default fans out to
+# roughly 23 GiB of compiler memory.
+#
+# On GB10 that lands on top of the weights, because unified memory means the
+# 89.19 GiB of resident weights came out of the same 128 GB pool as host RAM.
+# The JIT storm runs during determine_available_memory() -- i.e. AFTER the model
+# has loaded -- so it is the last thing standing between a 9-minute load and a
+# working server. Observed 2026-09-29: host memory hit earlyoom's 4% SIGTERM
+# threshold on BOTH nodes simultaneously, earlyoom killed the cudafe++ processes
+# (badness 1338), and the Ray workers then died with "connection error code 2.
+# End of file." -- which reads like a crash, not an out-of-memory event.
+#
+# 2 keeps the compile serialised enough to fit. Raise only if you have verified
+# headroom; the failure mode is a dead worker ~9 minutes into a load.
+export MAX_JOBS=2
+
 # Tells run_*node_2.sh which variables to forward into the Ray container's env.
 # Append additional names here if you add more model-specific runtime flags.
-export VLLM_FORWARD_VARS="VLLM_ALLOW_LONG_MAX_MODEL_LEN"
+export VLLM_FORWARD_VARS="VLLM_ALLOW_LONG_MAX_MODEL_LEN MAX_JOBS"
