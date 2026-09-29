@@ -366,7 +366,15 @@ single `cicc` on the worst of them measures **5284 MiB RSS**: 4.5x the ~1.17 GiB
 compiler at object 20 of 97, ~40 minutes into the build on top of a ~9 minute
 load, and the worker and engine died with it.
 
-Two fixes, both committed:
+**The second attempt then failed at the link, not the compile.** All 97 objects
+built, and `ld` could not find `-lnvrtc`: the image ships the runtime SONAME
+`libnvrtc.so.13` but not the unversioned `libnvrtc.so` that `-l` resolves. The
+Dockerfile now creates that symlink too (`cluster/Dockerfile`). Lesson worth
+keeping: making the headers available got the units to *compile*; the library
+symlink is a separate, later failure that only shows up after ~20 minutes of
+successful compilation.
+
+Three fixes, all committed:
 
 1. `run_cluster.sh` now bind-mounts `~/.cache/flashinfer`. Before this the JIT
    output lived in the container's writable layer and was destroyed with the
@@ -376,12 +384,14 @@ Two fixes, both committed:
 2. `glm/precompile-moe.sh` builds the module with **no model loaded**, where
    ~110 GiB is free instead of ~10 GiB. That inverts the constraint: `MAX_JOBS`
    can go to 10 rather than being throttled to 2.
+3. `cluster/Dockerfile` creates `/usr/local/cuda/lib64/libnvrtc.so` so the final
+   link resolves. Rebuild the image on both nodes after pulling.
 
 Run on each node (the JIT cache is per node, like the weights), then restart the
 cluster so the containers pick up the new mount:
 
 ```bash
-bash glm/precompile-moe.sh                      # ~65 min at MAX_JOBS=10
+bash glm/precompile-moe.sh                      # ~20-25 min at MAX_JOBS=10
 docker stop node-*                              # BOTH nodes
 source glm/cluster-env.sh && make head PROFILE=glm      # Node 1
 source glm/cluster-env.sh && make worker PROFILE=glm    # Node 2

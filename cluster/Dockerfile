@@ -41,3 +41,27 @@ RUN set -eux; \
       done; \
     done; \
     test -e /usr/local/cuda/include/nvrtc.h
+
+# Create the unversioned developer symlinks `ld -l<name>` resolves.
+#
+# The header link above gets the 97 translation units to COMPILE; this gets the
+# result to LINK. FlashInfer's final step is
+#   c++ ... -L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs -lcudart -lcuda -lnvrtc
+# and `-lnvrtc` makes ld look for the unversioned `libnvrtc.so`. This image ships
+# only the runtime SONAME `libnvrtc.so.13` -- the devel symlink that normally comes
+# with the CUDA toolkit package is absent -- so the link dies with
+#   /usr/bin/ld: cannot find -lnvrtc: No such file or directory
+# after every one of the 97 objects has compiled successfully.
+#
+# Only nvrtc is affected: libcudart.so is present, and libcuda.so is supplied by
+# the stubs directory already on the link line. The loop is written generally and
+# guarded so it is a no-op wherever the symlink already exists.
+RUN set -eux; \
+    for lib in nvrtc; do \
+      so="/usr/local/cuda/lib64/lib${lib}.so"; \
+      if [ ! -e "$so" ]; then \
+        target="$(ls -1 /usr/local/cuda/lib64/lib${lib}.so.* 2>/dev/null | head -1 || true)"; \
+        if [ -n "$target" ]; then ln -s "$(basename "$target")" "$so"; fi; \
+      fi; \
+    done; \
+    test -e /usr/local/cuda/lib64/libnvrtc.so
