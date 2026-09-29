@@ -91,6 +91,10 @@ bash glm/verify-image.sh
 
 Digest, never tag: a third-party tag can move under you. `cluster/build-image.sh` stamps the base as a `glm.base.digest` label and `glm/verify-image.sh` gates on it. That base carries the day-0 SM121 fixes (SM90 NoPE sparse-MLA extended to SM121 via FA2, FlashInfer pinned 0.6.18 because 0.6.17 produced NaN at batch 64–256 rows, NCCL 2.30.7, CUTLASS 4.6.2, PDL gated off, FA2 fp8-KV tile capped to 16 which is what makes fp8 KV usable here) but ships **no Ray** — which is exactly the one thing `cluster/Dockerfile` adds. Run the build on each node; local tags are not registry-backed.
 
+`cluster/Dockerfile` also links the pip wheel's CUDA headers into `/usr/local/cuda/include`, because FlashInfer's JIT includes `<nvrtc.h>` and the base image ships it only at `dist-packages/nvidia/cu13/include/`. Without that link the CUTLASS MoE build dies with `fatal error: nvrtc.h: No such file or directory`. With it, `MOE_BACKEND=flashinfer_cutlass` becomes usable — worth trying, since marlin logs *"Your GPU does not have native support for FP4 computation"* and therefore is not using the FP4 tensor cores. (That warning is expected and correct for this weight-only NVFP4-A16 checkpoint; it is not a fallback.)
+
+Image IDs will **not** match across the two Sparks — each builds independently and the layers are not bit-reproducible. Compare the **ray version** and the **base digest**, never the image ID.
+
 `glm/verify-image.sh` is a real gate, not a formality: those pins are load-bearing for SM121 *correctness*, so if `ray[default]` moved FlashInfer off 0.6.18 the result is wrong numbers, not a build error. It allows the layer to ADD packages and fails on any version change or removal. It caught a genuine case on first use — an image built before the label existed.
 
 **Memory is the binding constraint, much more than for Nemotron:** 181 GiB of weights → 90.5 GiB/node at TP=2; `0.85 × 121.63` = 103.4 GiB budget; **~12.9 GiB/node** left for KV + activations + graphs, roughly half Nemotron's headroom. Consequences baked into the launcher: `GPU_MEM_UTIL` 0.85 is a **ceiling** and the launcher refuses anything higher (0.90 is documented to OOM); KV is fp8 with an explicit 6 GiB budget rather than "whatever is left"; `--block-size 2304`; `ENABLE_EAGER` defaults **on** (graph capture is a spike, and `capture_end` is where the cgroup-permission failure historically first surfaced).
@@ -102,6 +106,47 @@ The checkpoint declares the **multimodal** architecture `Glm5NextForConditionalG
 **`glm/cluster-env.sh` forwards exactly ONE var, and must not be modelled on nemotron's four.** Two of Nemotron's (`VLLM_NVFP4_GEMM_BACKEND`, `VLLM_USE_FLASHINFER_MOE_FP4`) **do not exist** in this image's vLLM build — it is the patched glm53-flash build (`0.1.dev20051+g487ecf187`), not NGC 26.05, and its env surface differs. `VLLM_ATTENTION_BACKEND` is not env-selectable either, so the SM121 path is chosen by the image's patches rather than by us. Only `VLLM_ALLOW_LONG_MAX_MODEL_LEN` is forwarded, as cheap insurance for raising `MAX_MODEL_LEN` toward the native 1M. `glm/DISCOVERY.md` records every one of these with the command that established it — read it before adding a var.
 
 DFlash2 speculative decoding is **off by default** so a plain run is licence-clean. The drafter `incoai/GLM-5.3-Flash-DFlash2` is **CC-BY-NC-ND-4.0**: research/personal use only, never redistributed, never baked into a shared image. Enable with `ENABLE_DFLASH2=1`. Note the vLLM method string is **`dflash`**, not `dflash2` — the "2" is in the drafter's architecture (`DFlash2DraftModel`, which resolves to the Qwen3 DFlash2 class because the drafter is Qwen3-shaped). If this deployment ever needs to be licence-clean *and* fast, the alternative is MTP, which requires the `RedHatAI/GLM-5.3-Flash-NVFP4` checkpoint instead.
+
+### Serving flags this model actually needs (all learned the hard way)
+
+Every one of these cost a failed bring-up, several of them ~9 minutes into a load. They are in `glm/launch-glm53-flash.sh`; this is why.
+
+| Flag | Why |
+|---|---|
+| `--distributed-executor-backend ray` | This build defaults to `mp` (`config/parallel.py:917`) and does **not** infer Ray from a live cluster the way NGC 26.05 does. Without it: *"World size (2) is larger than the number of available GPUs (1)"* at config time. |
+| `--kv-cache-memory-bytes` | `--kv-cache-memory` is **not a registered flag**; it resolves only through argparse prefix-abbreviation and breaks the moment another `--kv-cache-memory*` option appears. |
+| `--moe-backend marlin` | The auto choice (`FLASHINFER_CUTLASS`) JIT-builds `fused_moe_120` at profiling time. That build needs `nvrtc.h`, which the base image ships only inside the pip wheel — see the image note below. marlin is prebuilt and needs no JIT. |
+| `--limit-mm-per-prompt {"image":0,"video":0}` | **`--skip-mm-profiling` alone does NOT give a text-only run.** It skips the engine's profiling pass; the API server still warms the vision processor afterwards (`renderers/base.py`), which took 51 s + 24 s and got rank 0 OOM-killed *after* `Application startup complete`. The warmup gate is `mm_limits = {k: v for k, v in allowed_mm_limits.items() if v > 0}`, so the limits must be **set to zero**, not omitted. Confirmed working when the log says `running in text-only mode`. |
+| `--kernel-config` disabling autotune + warmups | FlashInfer autotune (~53 s) plus repeated TileLang compiles spike host memory *after* the KV cache is already reserved. earlyoom SIGTERMed rank 0 there. Kernels still compile lazily on first use. |
+| `MAX_JOBS=2` (forwarded) | `MAX_JOBS` defaults to the **CPU count** (20) and drives ninja's parallel workers in FlashInfer's JIT; each spawns a `cudafe++` at ~1.17 GiB, so the default fans out to ~23 GiB of compiler memory on top of resident weights. |
+
+**A repo-id `--model` does not work.** `Glm5NextProcessor.from_pretrained` does a raw `open(os.path.join(model_path, "processor_config.json"))` (`transformers_utils/processors/glm5next.py:853`) instead of resolving through the Hub, so it only accepts a local directory. The launcher resolves the repo id via `snapshot_download` and passes the snapshot path, keeping `--served-model-name` so clients are unaffected.
+
+**`GPU_MEM_UTIL` is inert while `kv_cache_memory_bytes` is set.** vLLM says so in the log: *"reserved 6.0 GiB ... and skipped memory profiling. This does not respect the gpu_memory_utilization config."* The launcher still refuses values above 0.85, which matters only if the KV budget is ever unset.
+
+### Memory is the binding constraint, and pulsar is the binding node
+
+Measured at 262K, text-only, model resident:
+
+| | pulsar | magnetar |
+|---|---|---|
+| idle | **6.6 GB** | 11.1 GB |
+| during a 60K-token prefill | **6.1 GB** | 10.6 GB |
+| earlyoom SIGTERM at | ~4.9 GB | ~4.9 GB |
+
+**pulsar runs ~4.5 GB tighter than magnetar, every time.** Working margin there is 1.2–1.7 GB. KV is *not* the limit — 6 GiB buys 925,447 tokens (3.53x concurrency at 262K) — so `KV_CACHE_MEMORY` is the lever with the most slack whenever headroom is needed. Enabling DFlash2 requires it: the drafter is 2.34 GB, more than the whole margin, so the launcher trades KV 6 GiB → 3 GiB automatically when `ENABLE_DFLASH2=1`.
+
+Every memory failure in this deployment presented as something else — a Ray `SYSTEM_ERROR`, a "connection error code 2", a worker dying with no message. **`journalctl -u earlyoom` is the first thing to check**, not the last; it names the process and the threshold every time.
+
+### The reasoning parser drops the chain-of-thought (open defect)
+
+The chat template ends the prompt with `<|assistant|><think>` (`chat_template.jinja:256`), so `<think>` is in the **prompt** and the model emits reasoning then `</think>`. `content` is always correct and never contaminated — but `reasoning_content` is `None` with **every** parser tried (`deepseek_r1`, `glm47`), with `chat_template_kwargs` `{"thinking":true}` and `{"enable_thinking":true}`, and in streaming (0 reasoning deltas).
+
+The state machine is working as designed — `parser/glm47_moe.py:125` sets `initial_state=ParserState.REASONING if thinking`, which is exactly why content stays clean — but the REASONING events never reach `reasoning_content` in either aggregation path. This looks like a defect in this day-0 build. It costs nothing for ordinary use; the chain-of-thought is simply discarded. To see it, call `/v1/completions` with the rendered prompt.
+
+Note the template's kwargs are **`reasoning_effort`** (`low`/`high`, default `max`) and **`clear_thinking`** — *not* the `enable_thinking` the published recipes mention, which this template ignores entirely.
+
+**Short outputs look like a parser failure and are not.** With a small `max_tokens` the model never closes `</think>`, so everything lands in the discarded reasoning and both `content` and `reasoning_content` come back `None`. Give it ≥256 tokens before concluding anything.
 
 **The HuggingFace cache is per node, and Ray TP needs the checkpoint on EVERY node.** `run_cluster.sh` bind-mounts `~/.cache/huggingface` from each host separately — there is no shared filesystem — and each rank loads its shard from its own node's disk. A checkpoint present only on the head fails ~30 s into engine init as a Ray traceback that names the path but not the reason: `ray::RayWorkerProc.initialize_worker() (ip=10.0.0.2) RuntimeError: Cannot find any model weights with '/root/.cache/.../snapshots/...'`, while rank 0 happily logs `Checkpoint size: 181.30 GiB`. So GLM needs ~181 GiB on **both** Sparks, ~362 GiB total.
 

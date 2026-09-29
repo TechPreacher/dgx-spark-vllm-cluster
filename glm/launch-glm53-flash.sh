@@ -59,6 +59,9 @@ MODEL_CKPT="${MODEL_CKPT:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
 SERVED_NAME="${SERVED_NAME:-zai-org/glm-5.3-flash}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+# KV budget. 6 GiB gives 925,447 tokens = 3.53x concurrency at 262K, far more
+# than a single-operator setup needs, so this is the lever with the most slack
+# when host memory is tight. With DFlash2 it MUST come down: see below.
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-6442450944}"
 BLOCK_SIZE="${BLOCK_SIZE:-2304}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
@@ -278,6 +281,19 @@ EAGER_FLAG=""
 # DFlashModelTypes = Literal["dflash"]. vLLM derives n_predict from the drafter's
 # block_size (8) when unset, and sets parallel_drafting=True for dflash.
 # See glm/DISCOVERY.md.
+# DFlash2 loads a SECOND model (incoai/GLM-5.3-Flash-DFlash2, 2.34 GB of weights)
+# on top of the 88.63 GiB target. Measured host headroom at 262K is only
+# ~1.2-1.7 GiB on pulsar, which is LESS than the drafter needs -- enabling
+# speculation at the default KV budget walks straight into earlyoom's SIGTERM.
+# So trade KV down: 3 GiB still yields roughly 460k tokens (~1.75x concurrency
+# at 262K) and frees 3 GiB, comfortably covering the drafter.
+# Override KV_CACHE_MEMORY explicitly to opt out of this adjustment.
+if [[ "${ENABLE_DFLASH2}" == "1" && -z "${KV_CACHE_MEMORY_EXPLICIT:-}" && "${KV_CACHE_MEMORY}" == "6442450944" ]]; then
+  KV_CACHE_MEMORY=3221225472
+  echo "  NOTE: DFlash2 is on -- KV budget reduced 6 GiB -> 3 GiB to make room for"
+  echo "        the 2.34 GB drafter. Set KV_CACHE_MEMORY explicitly to override."
+fi
+
 SPEC_FLAG=""
 if [[ "${ENABLE_DFLASH2}" == "1" ]]; then
   if [[ -n "${GLM_SPEC_CONFIG:-}" ]]; then

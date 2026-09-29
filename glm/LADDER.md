@@ -112,7 +112,7 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 | 1 | 32K | n/a | fp8, 6 GiB | off | Weights load; TP2 collectives alive across RoCE | 8.1 GB | 12.4 GB | ~14.7 | **PASS** |
 | 2 | 131K | n/a | fp8, 6 GiB | off | KV math holds | — | — | — | _skipped — went straight to 262K_ |
 | 3 | 262K | n/a | fp8, 6 GiB | off | Target context | 6.6 GB idle / 6.1 GB under 60K load | 11.1 GB | ~14.7 | **PASS** |
-| 4 | 262K | 0.85 | fp8, 6 GiB | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _pending_ |
+| 4 | 262K | n/a | fp8, **3 GiB** | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _ready to run_ |
 
 ### Abort criteria — any one, on either node
 
@@ -349,9 +349,18 @@ which this template ignores entirely.
 
 ## Rung 4 notes: what to watch
 
-The drafter slot-shares MLA tensors and should add **no** KV cost, so a large
-`MemAvailable` drop when enabling it is a signal something is wrong, not a cost
-to accept.
+**The drafter is 2.34 GB of weights — larger than pulsar's entire 1.2–1.7 GB
+margin at 262K.** The recipe's claim that DFlash2 "slot-shares MLA tensors" and
+adds no KV cost is about the *KV cache*; the drafter's own parameters are still a
+second model loaded on every node. Enabling speculation at the 6 GiB KV budget
+walks straight into earlyoom.
+
+So the launcher trades KV down automatically when `ENABLE_DFLASH2=1`: 6 GiB →
+3 GiB, which still leaves roughly 460k tokens (~1.75x concurrency at 262K) and
+frees 3 GiB — comfortably more than the drafter needs. Override
+`KV_CACHE_MEMORY` explicitly to opt out.
+
+Both nodes already hold the drafter (2.2 GB each, fetched 2026-09-29).
 
 Published reference is 46.9 tok/s at 74.1% acceptance, but that came from a
 Ray-less rank-launch path, so it may not transfer exactly. Record what this

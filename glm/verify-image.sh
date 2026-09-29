@@ -92,8 +92,14 @@ echo "ray         OK (${RAY_VER})"
 # ray[default] is deliberately unpinned in cluster/Dockerfile and each node builds
 # its own local tag, so a rebuild months apart can land different Ray versions on
 # the two Sparks -- the same split-pair hazard the repo forbids for driver
-# versions. Print both so the two nodes' outputs can be compared by eye.
-echo "compare     ${RAY_VER} / ${IMAGE_ID}   <- must match on the other Spark"
+# versions. Print the ray version so the two nodes can be compared by eye.
+#
+# The image ID is printed for reference only and will NOT match across nodes:
+# each Spark builds independently and the layers are not bit-reproducible
+# (observed 74ec3fa9165b vs 535c2a1ed231 from the same Dockerfile and base).
+# Compare the RAY VERSION and the base digest, never the image ID.
+echo "compare     ray ${RAY_VER}   <- this must match on the other Spark"
+echo "image id    ${IMAGE_ID}   (informational; differs per node by design)"
 
 echo
 echo "OK  ${LAYERED_TAG} is safe to use on $(hostname)."
