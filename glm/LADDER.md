@@ -113,7 +113,7 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 | 1 | 32K | n/a | fp8, 6 GiB | off | Weights load; TP2 collectives alive across RoCE | 8.1 GB | 12.4 GB | ~14.7 | **PASS** |
 | 2 | 131K | n/a | fp8, 6 GiB | off | KV math holds | — | — | — | _skipped — went straight to 262K_ |
 | 3 | 262K | n/a | fp8, 6 GiB | off | Target context | 6.6 GB idle / 6.1 GB under 60K load | 11.1 GB | ~14.7 | **PASS** |
-| 4 | 262K | n/a | fp8, **3 GiB** | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _ready to run_ |
+| 4 | 262K | n/a | fp8, **3 GiB** | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | 6.5 GB | — | **40.6** warm | **PASS — 2.8x** |
 | 5 | 262K | n/a | fp8, 6 GiB | off, **CUTLASS MoE** | FP4 tensor cores vs marlin's weight-only 14.7 | 6.1 GB under load | 10.6 GB | **14.4** | **PASS, but no speedup** |
 
 ### Abort criteria — any one, on either node
@@ -446,6 +446,71 @@ The infrastructure now exists either way and costs nothing to leave in place.
 fixes (nvrtc header + `libnvrtc.so`), a persisted JIT cache, and a precompile
 path -- without which *any* FlashInfer JIT on this cluster fails, whatever the
 backend.
+
+## Rung 4 RESULT: PASS, 2.8x faster decode (2026-09-29)
+
+The best result on the ladder. Speculation attacks the bandwidth bound that
+rung 5 proved was the real constraint: one weight read now yields ~5 tokens
+instead of 1.
+
+| Measurement | DFlash2 | baseline (cutlass, rung 5) |
+|---|---|---|
+| decode, warm median | **40.6 tok/s** (5 runs) | 14.4 tok/s |
+| decode, peak run | **48.9 tok/s** | 14.4 |
+| decode, incl. cold run | 37.5 tok/s (3 runs) | — |
+| MemAvailable pulsar | 6.5 GB | 6.1-6.5 GB |
+
+**2.8x on the warm median**, and the peak 48.9 tok/s *exceeds* the published
+46.9. `init engine` took 191.88 s (vs 126.10 s without the drafter).
+
+### Acceptance: 58.9%, well below the published 74.1% -- and it still wins
+
+From `/metrics` after the first benchmark (234 drafts, 1638 draft tokens):
+
+```
+accepted / drafted   : 965 / 1638 = 58.9%      (published: 74.1%)
+mean accepted/draft  : 4.12 of 7 -> ~5.12 tokens per verify step
+per-position:  pos0 88.9%  pos1 76.9%  pos2 66.7%  pos3 56.8%
+               pos4 50.0%  pos5 40.6%  pos6 32.5%
+```
+
+We get 2.8x *despite* acceptance being 15 points below the published figure,
+which is consistent with the published number coming from a Ray-less rank-launch
+path. Two tuning levers are visible in that table and both are untested:
+
+* **`num_speculative_tokens=7` may be too long.** Positions 5 and 6 are accepted
+  only 40.6% and 32.5% of the time, so the last two draft slots mostly burn
+  compute. Trying 5 is the obvious experiment; it could go either way, because
+  shorter drafts also mean fewer tokens per verify when they *do* land.
+* **`max_num_batched_tokens`.** vLLM warns at startup: *"max_num_scheduled_tokens
+  is set to 2048 based on the speculative decoding settings. This may lead to
+  suboptimal performance."*
+
+### The cost: KV drops to 1.18x concurrency
+
+```
+GPU KV cache size: 310,292 tokens
+Maximum concurrency for 262,144 tokens per request: 1.18x
+```
+
+Down from 925,447 tokens / 3.53x, because the launcher trades KV 6 GiB -> 3 GiB
+to fit the 2.34 GB drafter. Fine for single-user research use; it means you can
+hold roughly one full-length 262K request rather than three. Raise
+`KV_CACHE_MEMORY` only if you also free memory elsewhere -- pulsar's margin is
+still the binding constraint at 6.5 GB.
+
+### First request after startup is slow -- this is warmup, not a regression
+
+Run 1 of the first benchmark was **7.37 tok/s** (54.3 s), runs 2-3 were 37.5 and
+38.6. The startup log shows why: `mhc_fused_tilelang` and the xqa decode path
+compile on first inference. Do not benchmark the first request.
+
+### Licence reminder
+
+`incoai/GLM-5.3-Flash-DFlash2` is **CC-BY-NC-ND-4.0**: research/personal use
+only, never redistributed, never baked into a shared image. `ENABLE_DFLASH2`
+therefore stays **off by default** so a plain `make serve` is licence-clean --
+that is a deliberate choice, not an oversight, and it is why this 2.8x is opt-in.
 
 ## Rung 4 notes: what to watch
 
