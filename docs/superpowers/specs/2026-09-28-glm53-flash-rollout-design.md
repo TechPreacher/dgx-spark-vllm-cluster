@@ -21,7 +21,7 @@ speed. Published figure to validate against is 46.9 tok/s single-stream decode a
 | Use case | Personal / research only | DFlash2 drafter (CC-BY-NC-ND-4.0) is permitted. This deployment **cannot** become a commercial product without swapping to MTP. |
 | Checkpoint | `LibertAIDAI/GLM-5.3-Flash-NVFP4` (~181 GiB, weight-only NVFP4-A16) | Pairs with DFlash2. Rules out MTP, which only works on `RedHatAI/GLM-5.3-Flash-NVFP4`. |
 | Coexistence | Third launcher, `glm/` | Nemotron and Qwen stay. Only one model runs at a time — UMA cannot hold two. |
-| Modality | Text-only initially | `--skip-mm-profiling`, no `--limit-mm-per-prompt`. Preserves KV headroom. Vision is a later, separate change. |
+| Modality | Text-only initially | `--skip-mm-profiling` **and** `--limit-mm-per-prompt {"image":0,"video":0}`. Corrected 2026-09-29: omitting the limit flag does NOT give a text-only run — the API server still warms the vision processor. Vision is a later, separate change. |
 | Image strategy | Layer Ray onto the patched GHCR image (approach A) | Inherits 7 day-0 SM121 fixes without owning them. Introduces third-party image trust, mitigated by digest pinning. |
 
 Rejected alternatives:

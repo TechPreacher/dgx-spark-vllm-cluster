@@ -42,8 +42,14 @@ set -euo pipefail
 #
 # LICENCE: the DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) is
 # CC-BY-NC-ND-4.0 -- research / personal use only. Do not redistribute it and do
-# not bake it into a shared image. The target model itself is MIT. Leave
-# ENABLE_DFLASH2=0 for a licence-clean run.
+# not bake it into a shared image. The target model itself is MIT.
+#
+# This launcher defaults to ENABLE_DFLASH2=1 because rung 4 measured a 2.8x
+# decode speedup (40.6 tok/s warm vs 14.4), which is too large to leave opt-in
+# for this deployment's research use. THE DEFAULT THEREFORE PULLS IN A
+# NON-COMMERCIAL DEPENDENCY. Set ENABLE_DFLASH2=0 for a licence-clean run; do
+# that before serving any commercial traffic, or switch to MTP, which needs the
+# RedHatAI/GLM-5.3-Flash-NVFP4 checkpoint instead.
 #
 # See glm/DISCOVERY.md for how every flag and env var below was established.
 
@@ -59,19 +65,70 @@ MODEL_CKPT="${MODEL_CKPT:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
 SERVED_NAME="${SERVED_NAME:-zai-org/glm-5.3-flash}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+# KV budget. 6 GiB gives 925,447 tokens = 3.53x concurrency at 262K, far more
+# than a single-operator setup needs, so this is the lever with the most slack
+# when host memory is tight. With DFlash2 it MUST come down: see below.
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-6442450944}"
 BLOCK_SIZE="${BLOCK_SIZE:-2304}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 TP_SIZE="${TP_SIZE:-2}"
 PORT="${PORT:-8000}"
 ENABLE_EAGER="${ENABLE_EAGER:-1}"
-ENABLE_DFLASH2="${ENABLE_DFLASH2:-0}"
+ENABLE_DFLASH2="${ENABLE_DFLASH2:-1}"   # 2.8x decode; CC-BY-NC-ND drafter, see LICENCE above
 DRAFT_CKPT="${DRAFT_CKPT:-incoai/GLM-5.3-Flash-DFlash2}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-7}"
 # Recipes disagree: the checkpoint card says deepseek_r1, one 2-Spark recipe
 # says glm45. A wrong parser does not error -- it silently mis-splits
 # reasoning_content from content -- so this is probed at ladder rung 1.
 REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
+# This vLLM build defaults distributed_executor_backend to "mp" (config/parallel.py
+# :917) and does NOT infer "ray" from a live Ray cluster the way the NGC 26.05
+# build behind the Nemotron path does. Without this flag, multiprocessing sees one
+# local GPU and refuses world size 2 outright:
+#   "World size (2) is larger than the number of available GPUs (1) in this node."
+# Accepted values: ray | mp | uni | external_launcher.
+DIST_BACKEND="${DIST_BACKEND:-ray}"
+# MoE backend. The image auto-selects FLASHINFER_CUTLASS, which JIT-builds a
+# fused_moe_120 module at profile time -- and that build FAILS in this image:
+#   tensorrt_llm/deep_gemm/jit_utils.cuh:21:10: fatal error: nvrtc.h: No such file
+# nvrtc.h does exist, but only in the pip wheel's include dir
+# (dist-packages/nvidia/cu13/include/), which FlashInfer's nvcc line does not
+# add. cluster/Dockerfile now links it into /usr/local/cuda/include, so after a
+# rebuild flashinfer_cutlass becomes usable; until then marlin is prebuilt and
+# needs no JIT at all. marlin is also what the Nemotron NVFP4 path uses on SM121
+# and what the 2-Spark recipe specifies, so it is the conservative default.
+# Fallback order if marlin misbehaves: flashinfer_trtllm, then vllm_cutlass.
+MOE_BACKEND="${MOE_BACKEND:-marlin}"
+# Multimodal limits. --skip-mm-profiling does NOT make this a text-only run: it
+# skips the engine's profiling pass, but the API server still warms the vision
+# processor afterwards (renderers/base.py, "Multi-modal warmup"), which took
+# 51s + 24s here and spiked host memory enough for earlyoom to SIGTERM rank 0 --
+# AFTER "Application startup complete", so the server came up and immediately
+# died. The warmup gate is:
+#     mm_limits = {k: v for k, v in allowed_mm_limits.items() if v > 0}
+# so zeroing the limits empties it and the warmup builds no multimodal items.
+# Being text-only therefore means SETTING these to 0, not omitting the flag.
+LIMIT_MM="${LIMIT_MM:-{\"image\":0,\"video\":0\}}"
+# Kernel warmup / autotune. The engine gets all the way through KV-cache
+# allocation and then spikes host memory in compile_or_warm_up_model():
+# FlashInfer autotune (~53 s, allocates workspaces) plus repeated TileLang
+# compiles of mhc_pre_big_fuse_with_norm / mhc_fused. Observed 2026-09-29:
+# earlyoom SIGTERMed rank 0 outright there --
+#   sending SIGTERM to process ... "ray::RayWorkerP": badness 1360, VmRSS 5803 MiB
+# -- on pulsar only, which starts with less free memory than magnetar
+# (106.94 vs 110.97 GiB after weights). Disabling the warmups removes that
+# spike and ~1-2 min of startup; the kernels still compile lazily on first use.
+# Re-enable once the memory envelope at the target context is known: autotune
+# is a throughput optimisation, so this trades some speed for getting up at all.
+KERNEL_CONFIG="${KERNEL_CONFIG:-{\"enable_flashinfer_autotune\":false,\"enable_cutedsl_warmup\":false,\"enable_jit_warmup\":false\}}"
+# The patched image's Glm5NextProcessor.from_pretrained does a raw
+#   open(os.path.join(model_path, "processor_config.json"))
+# (transformers_utils/processors/glm5next.py:853) instead of resolving through
+# the Hub, so it ONLY works when --model is a local directory. Passed a repo id
+# it dies with FileNotFoundError on a file it has already downloaded into the
+# cache. So resolve the repo id to its snapshot directory before serving.
+# Set MODEL_PATH to skip resolution and use a directory directly.
+MODEL_PATH="${MODEL_PATH:-}"
 EXPECTED_IMAGE="${EXPECTED_IMAGE:-local/vllm-ray-glm53:sm121-v11-dflash2}"
 EXPECTED_BASE_DIGEST="${EXPECTED_BASE_DIGEST:-$(cat "${SCRIPT_DIR}/BASE_DIGEST")}"
 
@@ -127,6 +184,10 @@ fi
 echo "Using container: ${VLLM_CONTAINER}  (${RUNNING_IMAGE})"
 echo "  model:             ${MODEL_CKPT}"
 echo "  TP:                ${TP_SIZE}"
+echo "  executor backend:  ${DIST_BACKEND}"
+echo "  moe backend:       ${MOE_BACKEND}"
+echo "  limit-mm:          ${LIMIT_MM}"
+echo "  kernel-config:     ${KERNEL_CONFIG}"
 echo "  max-model-len:     ${MAX_MODEL_LEN}"
 echo "  gpu-mem-util:      ${GPU_MEM_UTIL}"
 echo "  kv-cache-memory:   ${KV_CACHE_MEMORY}"
@@ -141,6 +202,9 @@ echo "  port:              ${PORT}"
 # head container's env, the user did not source glm/cluster-env.sh before
 # bring-up. Rank 1 on the worker will not have them either, and the run hangs in
 # a collective rather than erroring. Fail here with the fix instead.
+# Read back what the container actually has, for the banner above -- MAX_JOBS
+# only helps if it reached the container at start time.
+MAX_JOBS_SEEN=$(docker exec "${VLLM_CONTAINER}" printenv MAX_JOBS 2>/dev/null || echo "<unset>")
 FORWARD_VARS=$(bash -c 'source '"${SCRIPT_DIR}"'/cluster-env.sh >/dev/null 2>&1; echo "${VLLM_FORWARD_VARS}"')
 # An empty list makes the loop below iterate zero times, so the guard would pass
 # silently -- which is what happened if cluster-env.sh was missing or errored.
@@ -160,6 +224,8 @@ MISSING_VARS=$(docker exec "${VLLM_CONTAINER}" /bin/bash -c '
   done
   echo "${missing}"
 ' 2>/dev/null | xargs) || true
+echo "  MAX_JOBS in ctr:   ${MAX_JOBS_SEEN}"
+
 if [[ -n "${MISSING_VARS}" ]]; then
   cat >&2 <<EOF
 ERROR: Required GLM env vars are not set inside the Ray container:
@@ -221,6 +287,21 @@ EAGER_FLAG=""
 # DFlashModelTypes = Literal["dflash"]. vLLM derives n_predict from the drafter's
 # block_size (8) when unset, and sets parallel_drafting=True for dflash.
 # See glm/DISCOVERY.md.
+# DFlash2 loads a SECOND model (incoai/GLM-5.3-Flash-DFlash2, 2.34 GB of weights)
+# on top of the 88.63 GiB target. Measured host headroom at 262K is only
+# ~1.2-1.7 GiB on pulsar, which is LESS than the drafter needs -- enabling
+# speculation at the default KV budget walks straight into earlyoom's SIGTERM.
+# So trade KV down: 3 GiB frees enough to cover the drafter comfortably.
+# MEASURED 2026-09-29 (this estimate previously said ~460k tokens / ~1.75x, which
+# was wrong): 3 GiB yields 310,292 tokens = 1.18x concurrency at 262K, and pulsar
+# sat at 6.5 GB MemAvailable throughout -- no earlyoom activity.
+# Override KV_CACHE_MEMORY explicitly to opt out of this adjustment.
+if [[ "${ENABLE_DFLASH2}" == "1" && -z "${KV_CACHE_MEMORY_EXPLICIT:-}" && "${KV_CACHE_MEMORY}" == "6442450944" ]]; then
+  KV_CACHE_MEMORY=3221225472
+  echo "  NOTE: DFlash2 is on -- KV budget reduced 6 GiB -> 3 GiB to make room for"
+  echo "        the 2.34 GB drafter. Set KV_CACHE_MEMORY explicitly to override."
+fi
+
 SPEC_FLAG=""
 if [[ "${ENABLE_DFLASH2}" == "1" ]]; then
   if [[ -n "${GLM_SPEC_CONFIG:-}" ]]; then
@@ -237,6 +318,8 @@ docker exec -it \
   -e VLLM_API_KEY="${VLLM_API_KEY}" \
   -e HF_TOKEN="${HF_TOKEN}" \
   -e MODEL_CKPT="${MODEL_CKPT}" \
+  -e MODEL_PATH="${MODEL_PATH}" \
+  -e SKIP_WEIGHT_CHECK="${SKIP_WEIGHT_CHECK:-0}" \
   -e SERVED_NAME="${SERVED_NAME}" \
   -e MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
   -e GPU_MEM_UTIL="${GPU_MEM_UTIL}" \
@@ -244,20 +327,95 @@ docker exec -it \
   -e BLOCK_SIZE="${BLOCK_SIZE}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
   -e TP_SIZE="${TP_SIZE}" \
+  -e DIST_BACKEND="${DIST_BACKEND}" \
+  -e MOE_BACKEND="${MOE_BACKEND}" \
+  -e LIMIT_MM="${LIMIT_MM}" \
+  -e KERNEL_CONFIG="${KERNEL_CONFIG}" \
   -e PORT="${PORT}" \
   -e EAGER_FLAG="${EAGER_FLAG}" \
   -e SPEC_FLAG="${SPEC_FLAG}" \
   -e REASONING_PARSER="${REASONING_PARSER}" \
   "${VLLM_CONTAINER}" /bin/bash -c '
     set -euo pipefail
+
+    # Resolve the checkpoint to a LOCAL directory (see MODEL_PATH note above).
+    # snapshot_download is resumable and writes into the bind-mounted HF cache,
+    # so an interrupted pull continues rather than restarting.
+    if [[ -n "${MODEL_PATH}" ]]; then
+      MODEL_DIR="${MODEL_PATH}"
+    elif [[ "${MODEL_CKPT}" == /* || "${MODEL_CKPT}" == .* ]]; then
+      MODEL_DIR="${MODEL_CKPT}"
+    else
+      echo "Resolving ${MODEL_CKPT} to a local snapshot (~181 GiB on first run)..."
+      MODEL_DIR=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('"'"'${MODEL_CKPT}'"'"'))")
+      echo "Model directory: ${MODEL_DIR}"
+    fi
+    # export, not just assign: the probe below reads MODEL_DIR from the
+    # environment via os.environ, and a bare shell variable is not inherited.
+    export MODEL_DIR
+    if [[ ! -f "${MODEL_DIR}/processor_config.json" ]]; then
+      echo "ERROR: ${MODEL_DIR}/processor_config.json missing -- the glm5next" >&2
+      echo "processor reads it by path and will fail without it." >&2
+      exit 1
+    fi
+
+    # EVERY node must have the checkpoint, not just this one. The HF cache is
+    # bind-mounted per node, and each rank loads its shard from its own
+    # filesystem. Without this check, a worker missing the weights surfaces ~30s
+    # into engine init as a Ray traceback that names the path but not the cause.
+    # Probe via Ray so we see exactly the nodes Ray will schedule on, through the
+    # same mount the workers use -- no ssh, no assumptions about host names.
+    if [[ "${SKIP_WEIGHT_CHECK}" == "1" ]]; then
+      echo "Skipping the per-node checkpoint check (SKIP_WEIGHT_CHECK=1)."
+    else
+    echo "Checking every Ray node has the checkpoint..."
+    python3 - <<"PY"
+import os, sys, glob, socket
+import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+path = os.environ["MODEL_DIR"]
+ray.init(address="auto", logging_level="ERROR")
+
+@ray.remote(num_cpus=0)
+def probe(p):
+    return (socket.gethostname(),
+            os.path.isdir(p),
+            len(glob.glob(os.path.join(p, "*.safetensors"))))
+
+nodes = [n for n in ray.nodes() if n.get("Alive")]
+refs = [probe.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=n["NodeID"], soft=False)).remote(path) for n in nodes]
+
+bad = []
+for host, is_dir, n_files in ray.get(refs):
+    status = "ok" if (is_dir and n_files) else "MISSING"
+    print(f"  {host:<12} dir={is_dir} safetensors={n_files}  {status}")
+    if not (is_dir and n_files):
+        bad.append(host)
+
+if bad:
+    joined = ", ".join(bad)
+    print("", file=sys.stderr)
+    print("ERROR: checkpoint missing on: " + joined, file=sys.stderr)
+    print("Ray TP loads each shard from its own node filesystem, and the HF", file=sys.stderr)
+    print("cache is per node. Run this on the affected node(s):", file=sys.stderr)
+    print("  bash glm/fetch-weights.sh", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    fi
+
     SPEC_ARGS=()
     [[ -n "${SPEC_FLAG}" ]] && SPEC_ARGS+=(--speculative-config "${SPEC_FLAG}")
     # shellcheck disable=SC2086
-    exec vllm serve "${MODEL_CKPT}" \
+    exec vllm serve "${MODEL_DIR}" \
       --served-model-name "${SERVED_NAME}" \
       --host 0.0.0.0 \
       --port "${PORT}" \
       --tensor-parallel-size "${TP_SIZE}" \
+      --distributed-executor-backend "${DIST_BACKEND}" \
+      --moe-backend "${MOE_BACKEND}" \
+      --kernel-config "${KERNEL_CONFIG}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --kv-cache-dtype fp8 \
@@ -268,6 +426,7 @@ docker exec -it \
       --tool-call-parser glm47 \
       --reasoning-parser "${REASONING_PARSER}" \
       --skip-mm-profiling \
+      --limit-mm-per-prompt "${LIMIT_MM}" \
       ${EAGER_FLAG} \
       ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
   '

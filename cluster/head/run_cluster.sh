@@ -121,6 +121,18 @@ fi
 # --network host: Allows Ray nodes to communicate directly via host networking
 # --shm-size 10.24g: Increases shared memory
 # --gpus all: Gives container access to all GPUs on the host
+# -v FLASHINFER_CACHE: persist FlashInfer's JIT build cache on the HOST.
+#
+# Without this the cache lives only in the container's writable layer, so every
+# `docker stop` throws away compiled kernels and the next bring-up recompiles
+# from zero. That is not academic: the CUTLASS fused-MoE module is 97 nvcc
+# translation units, takes ~1h at MAX_JOBS=2, and a single `cicc` on the heavy
+# CUTLASS templates was measured at 5.3 GiB RSS -- large enough for earlyoom to
+# kill it mid-build and fail the whole engine start. Persisting the cache means
+# the build survives restarts and can be done ONCE, deliberately, by
+# glm/precompile-moe.sh while no model is resident.
+# Harmless for the Qwen/Nemotron paths, which simply never populate it.
+#
 # -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
 docker run \
     --entrypoint /bin/bash \
@@ -132,5 +144,6 @@ docker run \
     --cap-add=IPC_LOCK \
     --ulimit memlock=-1:-1 \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
+    -v "${PATH_TO_FLASHINFER_CACHE:-${HOME}/.cache/flashinfer}:/root/.cache/flashinfer" \
     "${ADDITIONAL_ARGS[@]}" \
     "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"

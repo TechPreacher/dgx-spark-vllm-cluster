@@ -56,7 +56,26 @@ There is intentionally no `qwen/cluster-env.sh` — the Qwen FP8 path requires n
 
 **Host-stability context:** an earlier `gpt-oss-120b` single-Spark run starved the host of memory so badly that sshd became unreachable while ICMP still replied; recovery required a power cycle. With TP=2, per-node weight memory is roughly halved versus that single-Spark run, but the Ray container has no `--memory` cgroup cap (that's set by `run_cluster.sh` at container create time, not editable after the fact). Defences here are: `--gpu-memory-utilization 0.75` (vs NVIDIA's 0.9), `--max-model-len 1048576` (1M tokens, model maximum; verified stable after a 512k checkpoint with host `MemAvailable` ~18 GB during inference; overridable via `MAX_MODEL_LEN`), and an opt-in `ENABLE_EAGER=1` that skips CUDA graph capture if first-inference memory spikes are a concern. MTP speculative decoding is off by default; enable with `ENABLE_MTP=1`.
 
-Out-of-repo hardening that complements the launcher (apply on **both** Sparks): `OOMScoreAdjust=-1000` on sshd via `systemctl edit ssh`, `earlyoom` package installed and enabled, plus an external laptop-side watchdog that IPMI/PDU-cycles on repeated `/health` failures.
+Out-of-repo hardening that complements the launcher (apply on **both** Sparks): `OOMScoreAdjust=-1000` on sshd, `earlyoom` installed **and reconfigured** (see below), plus an external laptop-side watchdog that IPMI/PDU-cycles on repeated `/health` failures.
+
+**Installing earlyoom is not enough — stock earlyoom is inert on these hosts.** Its default thresholds are an **AND** across memory and swap: `SIGTERM when mem <= 10% and swap <= 10%`, `SIGKILL when mem <= 5% and swap <= 5%`. Because `vm.swappiness=0` (the UVM-livelock defence) keeps the 16 GB of swap essentially unused, the swap condition is never met and earlyoom never fires under GPU-driven memory pressure. The two defences disarm each other, and `systemctl is-active earlyoom` reporting `active` gives false comfort. Set on both nodes:
+
+```
+sudo sed -i 's/^EARLYOOM_ARGS=.*/EARLYOOM_ARGS="-r 3600 -m 4,2 -s 100,100"/' /etc/default/earlyoom
+sudo systemctl restart earlyoom
+journalctl -u earlyoom --no-pager -n 25 | grep -E 'SIGTERM|SIGKILL' | tail -2
+```
+
+`-s 100,100` makes the swap side always true for **both** signals; `-m 4,2` is SIGTERM at ~4.9 GiB and SIGKILL at ~2.5 GiB of 124608 MiB. Give both kill percentages explicitly: with a bare `-m 4 -s 100` earlyoom halves *both*, yielding `SIGKILL when mem <= 2.00% and swap <= 50.00%`, which `swappiness=0` makes unreachable — SIGTERM would work but escalation would be disarmed for the one case it exists for, a process wedged in UVM livelock that ignores SIGTERM. Stock 10% (~12.2 GiB) is too aggressive — Nemotron's own notes record healthy operation at ~18 GB available. Once set, an out-of-memory rung presents as **vLLM being SIGTERMed**, not as a hang: check `journalctl -u earlyoom` before suspecting the model.
+
+**sshd protection on Ubuntu 24.04 here:** `ssh.socket` and `ssh.service` are both active, but the socket runs `Accept=no` and hands the fd to the single `ssh.service` listener — there are no per-connection `ssh@N.service` instances. So one drop-in on `ssh.service` is sufficient; no `ssh@.service` drop-in is needed. Verify with the **listener**, not `pgrep -o sshd` (which returns your own pre-existing session, whose `oom_score_adj` predates the change and reads `0` misleadingly):
+
+```
+for p in $(pgrep sshd); do printf '%s %s %s\n' "$p" "$(cat /proc/$p/oom_score_adj)" \
+  "$(awk -F/ '{print $NF}' /proc/$p/cgroup | head -1)"; done
+```
+
+The process in `ssh.service` must read `-1000`. New logins inherit it across the migration into their `session-N.scope`; existing sessions keep the old value until they reconnect.
 
 ## GLM-5.3-Flash-NVFP4 (Ray TP=2 across both Sparks)
 
@@ -72,6 +91,20 @@ bash glm/verify-image.sh
 
 Digest, never tag: a third-party tag can move under you. `cluster/build-image.sh` stamps the base as a `glm.base.digest` label and `glm/verify-image.sh` gates on it. That base carries the day-0 SM121 fixes (SM90 NoPE sparse-MLA extended to SM121 via FA2, FlashInfer pinned 0.6.18 because 0.6.17 produced NaN at batch 64–256 rows, NCCL 2.30.7, CUTLASS 4.6.2, PDL gated off, FA2 fp8-KV tile capped to 16 which is what makes fp8 KV usable here) but ships **no Ray** — which is exactly the one thing `cluster/Dockerfile` adds. Run the build on each node; local tags are not registry-backed.
 
+`cluster/Dockerfile` also fixes **two** nvrtc gaps in the base image, one for compiling and one for linking. First it links the pip wheel's CUDA headers into `/usr/local/cuda/include`, because FlashInfer's JIT includes `<nvrtc.h>` and the base image ships it only at `dist-packages/nvidia/cu13/include/`; without that the build dies with `fatal error: nvrtc.h: No such file or directory`. Second it creates `/usr/local/cuda/lib64/libnvrtc.so`, the unversioned developer symlink that `ld -lnvrtc` resolves. The image ships only the runtime SONAME `libnvrtc.so.13`, so the **final link fails after all 97 objects have compiled successfully**:
+```
+/usr/bin/ld: cannot find -lnvrtc: No such file or directory
+```
+Only nvrtc needs this — `libcudart.so` is present and `libcuda.so` comes from the stubs directory already on the link line. Fixing the headers without the library gets you 97 wasted compiles and a failure at the very last step. marlin logs *"Your GPU does not have native support for FP4 computation"* and therefore is not using the FP4 tensor cores. (That warning is expected and correct for this weight-only NVFP4-A16 checkpoint; it is not a fallback.) **Measured 2026-09-29: switching to `flashinfer_cutlass` does not help.** Decode is 14.4 tok/s against marlin's ~14.7, i.e. no gain, because single-stream decode is memory-bandwidth bound -- ~18B active params at ~0.5 byte each is 9-10 GB read per token, so FP4 tensor cores sit idle waiting on LPDDR5X. **Keep marlin as the default**; it is prebuilt and needs no JIT. CUTLASS is worth revisiting only for prefill-heavy or high-concurrency workloads (measured: ~1,268 prefill tok/s at 60K, 57.0 tok/s aggregate at 8 concurrent streams). See `glm/LADDER.md` rung 5.
+
+**The header link is necessary but not sufficient — do not just set `MOE_BACKEND=flashinfer_cutlass` and serve.** The module is 97 nvcc translation units, and vLLM only triggers the build on the first MoE forward, i.e. during KV-cache profiling with 88.63 GiB of weights already resident. That leaves ~10 GiB of host headroom, and a single `cicc` on the worst of these files measures **5284 MiB RSS** — 4.5x the `cudafe++` figure `MAX_JOBS=2` was sized against. earlyoom SIGTERMs the compiler, ninja fails, and the engine dies: observed at object 20 of 97, ~40 minutes into the build on top of a ~9 minute load.
+
+Build it ahead of time instead, with `bash glm/precompile-moe.sh` **on each node** (the JIT cache is per node, like the weights). It runs a throwaway container with no model loaded, so there is ~110 GiB free rather than ~10 GiB, which makes `MAX_JOBS=10` safe and the build far faster than the throttled in-serve attempt. It calls `gen_cutlass_fused_moe_sm120_module(False)` directly — flashinfer's `core.py:568` maps backend `"121"` onto the sm120 module, and both call sites pass only `device_arch`, leaving `use_fast_build` at `False`. Building with the other flag would produce a module vLLM silently never reuses.
+
+The result persists because `run_cluster.sh` bind-mounts `~/.cache/flashinfer`. Before that mount existed the JIT output landed in the container's writable layer and died with the container, so every restart paid the build again. The cache is version-scoped (`0.6.18.dev20260819/cached_ops`), so bumping FlashInfer invalidates it rather than reusing a module built against different headers. **A Ray container started before the mount was added does not have it** — restart the cluster after pulling, or the precompiled module is invisible to the server.
+
+Image IDs will **not** match across the two Sparks — each builds independently and the layers are not bit-reproducible. Compare the **ray version** and the **base digest**, never the image ID.
+
 `glm/verify-image.sh` is a real gate, not a formality: those pins are load-bearing for SM121 *correctness*, so if `ray[default]` moved FlashInfer off 0.6.18 the result is wrong numbers, not a build error. It allows the layer to ADD packages and fails on any version change or removal. It caught a genuine case on first use — an image built before the label existed.
 
 **Memory is the binding constraint, much more than for Nemotron:** 181 GiB of weights → 90.5 GiB/node at TP=2; `0.85 × 121.63` = 103.4 GiB budget; **~12.9 GiB/node** left for KV + activations + graphs, roughly half Nemotron's headroom. Consequences baked into the launcher: `GPU_MEM_UTIL` 0.85 is a **ceiling** and the launcher refuses anything higher (0.90 is documented to OOM); KV is fp8 with an explicit 6 GiB budget rather than "whatever is left"; `--block-size 2304`; `ENABLE_EAGER` defaults **on** (graph capture is a spike, and `capture_end` is where the cgroup-permission failure historically first surfaced).
@@ -82,7 +115,54 @@ The checkpoint declares the **multimodal** architecture `Glm5NextForConditionalG
 
 **`glm/cluster-env.sh` forwards exactly ONE var, and must not be modelled on nemotron's four.** Two of Nemotron's (`VLLM_NVFP4_GEMM_BACKEND`, `VLLM_USE_FLASHINFER_MOE_FP4`) **do not exist** in this image's vLLM build — it is the patched glm53-flash build (`0.1.dev20051+g487ecf187`), not NGC 26.05, and its env surface differs. `VLLM_ATTENTION_BACKEND` is not env-selectable either, so the SM121 path is chosen by the image's patches rather than by us. Only `VLLM_ALLOW_LONG_MAX_MODEL_LEN` is forwarded, as cheap insurance for raising `MAX_MODEL_LEN` toward the native 1M. `glm/DISCOVERY.md` records every one of these with the command that established it — read it before adding a var.
 
-DFlash2 speculative decoding is **off by default** so a plain run is licence-clean. The drafter `incoai/GLM-5.3-Flash-DFlash2` is **CC-BY-NC-ND-4.0**: research/personal use only, never redistributed, never baked into a shared image. Enable with `ENABLE_DFLASH2=1`. Note the vLLM method string is **`dflash`**, not `dflash2` — the "2" is in the drafter's architecture (`DFlash2DraftModel`, which resolves to the Qwen3 DFlash2 class because the drafter is Qwen3-shaped). If this deployment ever needs to be licence-clean *and* fast, the alternative is MTP, which requires the `RedHatAI/GLM-5.3-Flash-NVFP4` checkpoint instead.
+DFlash2 speculative decoding is **ON by default as of 2026-09-29** (`ENABLE_DFLASH2=1`), so **a plain run is NOT licence-clean** — set `ENABLE_DFLASH2=0` for that. The default was flipped because rung 4 measured **40.6 tok/s warm median vs 14.4 without, a 2.8x speedup**, with a peak run of 48.9 exceeding the published 46.9. Acceptance is 58.9% (965/1638 draft tokens), below the published 74.1%, and it wins anyway. The cost is KV: 310,292 tokens / 1.18x concurrency at 262K, down from 925,447 / 3.53x, because the launcher trades KV 6 GiB -> 3 GiB for the drafter. See `glm/LADDER.md` rung 4. The drafter `incoai/GLM-5.3-Flash-DFlash2` is **CC-BY-NC-ND-4.0**: research/personal use only, never redistributed, never baked into a shared image — which is exactly why the on-by-default choice is recorded loudly here and in `glm/launch-glm53-flash.sh`. Note the vLLM method string is **`dflash`**, not `dflash2` — the "2" is in the drafter's architecture (`DFlash2DraftModel`, which resolves to the Qwen3 DFlash2 class because the drafter is Qwen3-shaped). If this deployment ever needs to be licence-clean *and* fast, the alternative is MTP, which requires the `RedHatAI/GLM-5.3-Flash-NVFP4` checkpoint instead.
+
+### Serving flags this model actually needs (all learned the hard way)
+
+Every one of these cost a failed bring-up, several of them ~9 minutes into a load. They are in `glm/launch-glm53-flash.sh`; this is why.
+
+| Flag | Why |
+|---|---|
+| `--distributed-executor-backend ray` | This build defaults to `mp` (`config/parallel.py:917`) and does **not** infer Ray from a live cluster the way NGC 26.05 does. Without it: *"World size (2) is larger than the number of available GPUs (1)"* at config time. |
+| `--kv-cache-memory-bytes` | `--kv-cache-memory` is **not a registered flag**; it resolves only through argparse prefix-abbreviation and breaks the moment another `--kv-cache-memory*` option appears. |
+| `--moe-backend marlin` | The auto choice (`FLASHINFER_CUTLASS`) JIT-builds `fused_moe_120` at profiling time, which cannot succeed there — it needs `nvrtc.h` (shipped only inside the pip wheel) and ~5.3 GiB per compiler process against ~10 GiB of headroom. marlin is prebuilt and needs no JIT. Switch to `flashinfer_cutlass` only after `glm/precompile-moe.sh` has run on both nodes; see the image note below. |
+| `--limit-mm-per-prompt {"image":0,"video":0}` | **`--skip-mm-profiling` alone does NOT give a text-only run.** It skips the engine's profiling pass; the API server still warms the vision processor afterwards (`renderers/base.py`), which took 51 s + 24 s and got rank 0 OOM-killed *after* `Application startup complete`. The warmup gate is `mm_limits = {k: v for k, v in allowed_mm_limits.items() if v > 0}`, so the limits must be **set to zero**, not omitted. Confirmed working when the log says `running in text-only mode`. |
+| `--kernel-config` disabling autotune + warmups | FlashInfer autotune (~53 s) plus repeated TileLang compiles spike host memory *after* the KV cache is already reserved. earlyoom SIGTERMed rank 0 there. Kernels still compile lazily on first use. |
+| `MAX_JOBS=2` (forwarded) | `MAX_JOBS` defaults to the **CPU count** (20) and drives ninja's parallel workers in FlashInfer's JIT; each spawns a `cudafe++` at ~1.17 GiB, so the default fans out to ~23 GiB of compiler memory on top of resident weights. |
+
+**A repo-id `--model` does not work.** `Glm5NextProcessor.from_pretrained` does a raw `open(os.path.join(model_path, "processor_config.json"))` (`transformers_utils/processors/glm5next.py:853`) instead of resolving through the Hub, so it only accepts a local directory. The launcher resolves the repo id via `snapshot_download` and passes the snapshot path, keeping `--served-model-name` so clients are unaffected.
+
+**`GPU_MEM_UTIL` is inert while `kv_cache_memory_bytes` is set.** vLLM says so in the log: *"reserved 6.0 GiB ... and skipped memory profiling. This does not respect the gpu_memory_utilization config."* The launcher still refuses values above 0.85, which matters only if the KV budget is ever unset.
+
+### Memory is the binding constraint, and pulsar is the binding node
+
+Measured at 262K, text-only, model resident:
+
+| | pulsar | magnetar |
+|---|---|---|
+| idle | **6.6 GB** | 11.1 GB |
+| during a 60K-token prefill | **6.1 GB** | 10.6 GB |
+| earlyoom SIGTERM at | ~4.9 GB | ~4.9 GB |
+
+**pulsar runs ~4.5 GB tighter than magnetar, every time.** Working margin there is 1.2–1.7 GB. KV is *not* the limit — 6 GiB buys 925,447 tokens (3.53x concurrency at 262K) — so `KV_CACHE_MEMORY` is the lever with the most slack whenever headroom is needed. Enabling DFlash2 requires it: the drafter is 2.34 GB, more than the whole margin, so the launcher trades KV 6 GiB → 3 GiB automatically when `ENABLE_DFLASH2=1`.
+
+Every memory failure in this deployment presented as something else — a Ray `SYSTEM_ERROR`, a "connection error code 2", a worker dying with no message. **`journalctl -u earlyoom` is the first thing to check**, not the last; it names the process and the threshold every time.
+
+### The reasoning parser drops the chain-of-thought (open defect)
+
+The chat template ends the prompt with `<|assistant|><think>` (`chat_template.jinja:256`), so `<think>` is in the **prompt** and the model emits reasoning then `</think>`. `content` is always correct and never contaminated — but `reasoning_content` is `None` with **every** parser tried (`deepseek_r1`, `glm47`), with `chat_template_kwargs` `{"thinking":true}` and `{"enable_thinking":true}`, and in streaming (0 reasoning deltas).
+
+The state machine is working as designed — `parser/glm47_moe.py:125` sets `initial_state=ParserState.REASONING if thinking`, which is exactly why content stays clean — but the REASONING events never reach `reasoning_content` in either aggregation path. This looks like a defect in this day-0 build. It costs nothing for ordinary use; the chain-of-thought is simply discarded. To see it, call `/v1/completions` with the rendered prompt.
+
+Note the template's kwargs are **`reasoning_effort`** (`low`/`high`, default `max`) and **`clear_thinking`** — *not* the `enable_thinking` the published recipes mention, which this template ignores entirely.
+
+**Short outputs look like a parser failure and are not.** With a small `max_tokens` the model never closes `</think>`, so everything lands in the discarded reasoning and both `content` and `reasoning_content` come back `None`. Give it ≥256 tokens before concluding anything.
+
+**The HuggingFace cache is per node, and Ray TP needs the checkpoint on EVERY node.** `run_cluster.sh` bind-mounts `~/.cache/huggingface` from each host separately — there is no shared filesystem — and each rank loads its shard from its own node's disk. A checkpoint present only on the head fails ~30 s into engine init as a Ray traceback that names the path but not the reason: `ray::RayWorkerProc.initialize_worker() (ip=10.0.0.2) RuntimeError: Cannot find any model weights with '/root/.cache/.../snapshots/...'`, while rank 0 happily logs `Checkpoint size: 181.30 GiB`. So GLM needs ~181 GiB on **both** Sparks, ~362 GiB total.
+
+Populate with `bash glm/fetch-weights.sh` on each node (resumable, ~30 min each, both can run in parallel). It downloads from inside a throwaway container **on purpose**: the cache directories are created by the Ray container as root, so the host user cannot write into them — a host-side `hf download` or an `rsync` from the head fails on permissions even though the blobs themselves are world-readable. Writing from a container keeps ownership consistent with the serving path and needs no sudo.
+
+`glm/launch-glm53-flash.sh` preflights this by probing every Ray node through `NodeAffinitySchedulingStrategy`, so it reports `magnetar dir=True safetensors=0 MISSING` before serving rather than failing inside the engine. Bypass with `SKIP_WEIGHT_CHECK=1`.
 
 **One model at a time** — UMA cannot hold GLM and Nemotron concurrently. Tear down both ranks before relaunching; stale Ray/NCCL processes fight the next start.
 

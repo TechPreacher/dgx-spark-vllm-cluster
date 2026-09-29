@@ -189,21 +189,39 @@ Host-side hardening recommended once, outside this repo:
 
 GLM-5.3-Flash usage. Needs its **own** image — stock vLLM cannot run this model on GB10 at all (NoPE MLA, `qk_rope_head_dim=0`, against a sparse-attention kernel that assumes DeepSeek's `pe_dim=64`). Build once per node, then gate it:
 
+Once per node — image, gate, and weights (no shared filesystem, so both Sparks
+need their own copy of everything):
+
 ```bash
 BASE_IMAGE=ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6 \
 TAG=local/vllm-ray-glm53:sm121-v11-dflash2 bash cluster/build-image.sh
 bash glm/verify-image.sh
+bash glm/fetch-weights.sh                                          # ~181 GiB
+MODEL_CKPT=incoai/GLM-5.3-Flash-DFlash2 bash glm/fetch-weights.sh  # drafter (on by default)
 ```
+
+Then every start:
 
 ```bash
 source glm/cluster-env.sh && make head PROFILE=glm     # Node 1
 source glm/cluster-env.sh && make worker PROFILE=glm   # Node 2
 make serve PROFILE=glm                                 # Node 1, new terminal
 # glm/.env needs HF_TOKEN and VLLM_API_KEY
-# Override knobs via env (see glm/README.md):
-MAX_MODEL_LEN=131072 make serve PROFILE=glm            # climb the ladder, don't jump to 262K
-ENABLE_DFLASH2=1 make serve PROFILE=glm                # CC-BY-NC-ND drafter, research use only
 ```
+
+That is the whole command: 262K context and DFlash2 speculation are the
+defaults, giving ~40 tok/s decode. **The first request after startup runs at
+~7 tok/s while kernels compile — that is warmup, not a fault.** Overrides
+(see [glm/README.md](glm/README.md)):
+
+```bash
+ENABLE_DFLASH2=0 make serve PROFILE=glm       # licence-clean run, ~14 tok/s
+MAX_MODEL_LEN=131072 make serve PROFILE=glm   # shorter context
+```
+
+**The default is not licence-clean.** DFlash2's drafter is CC-BY-NC-ND-4.0 —
+research/personal use only. Ladder rungs 1, 3, 4 and 5 all pass; see
+[glm/LADDER.md](glm/LADDER.md).
 
 Memory is the binding constraint: 181 GiB of weights → 90.5 GiB/node at TP=2, leaving **~12.9 GiB/node** for KV + activations — roughly half Nemotron's headroom. `GPU_MEM_UTIL` 0.85 is a hard ceiling and the launcher refuses more (0.90 is documented to OOM). `earlyoom` and sshd `OOMScoreAdjust=-1000` are **prerequisites** for this profile, not optional hardening, and `vm.swappiness=0` on both nodes.
 

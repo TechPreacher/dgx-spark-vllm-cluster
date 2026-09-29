@@ -23,6 +23,7 @@ help:
 test:
 	@bash scripts/test_nvidia_lib.sh
 	@bash scripts/test_cluster_lib.sh
+	@bash scripts/test_glm_launcher.sh
 
 check-nvidia:
 	@bash scripts/check_nvidia.sh
