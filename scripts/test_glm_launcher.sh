@@ -50,6 +50,9 @@ absent  "serve is not given the raw repo id"           'vllm serve "\$\{MODEL_CK
 
 # The abbreviated form must not come back: it resolves today but breaks the moment
 # another --kv-cache-memory* option is registered, and it breaks at model launch.
+# The probe reads MODEL_DIR via os.environ, so a bare shell assignment is not
+# enough -- this exact omission cost a run.
+present "MODEL_DIR is exported for the probe"           "export MODEL_DIR"
 absent  "no abbreviated --kv-cache-memory"             '\-\-kv-cache-memory "'
 # Both sources warn against these two for this model generation.
 absent  "tool parser is not glm or glm45"              '\-\-tool-call-parser (glm|glm45) '

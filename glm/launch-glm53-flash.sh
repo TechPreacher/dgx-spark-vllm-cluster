@@ -282,6 +282,9 @@ docker exec -it \
       MODEL_DIR=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('"'"'${MODEL_CKPT}'"'"'))")
       echo "Model directory: ${MODEL_DIR}"
     fi
+    # export, not just assign: the probe below reads MODEL_DIR from the
+    # environment via os.environ, and a bare shell variable is not inherited.
+    export MODEL_DIR
     if [[ ! -f "${MODEL_DIR}/processor_config.json" ]]; then
       echo "ERROR: ${MODEL_DIR}/processor_config.json missing -- the glm5next" >&2
       echo "processor reads it by path and will fail without it." >&2
