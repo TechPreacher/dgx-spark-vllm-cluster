@@ -110,8 +110,8 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 | Rung | ctx | util | KV | Spec | Proves | MemAvail pulsar | MemAvail magnetar | decode tok/s | Result |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | 32K | n/a | fp8, 6 GiB | off | Weights load; TP2 collectives alive across RoCE | 8.1 GB | 12.4 GB | ~14.7 | **PASS** |
-| 2 | 131K | 0.85 | fp8, 6 GiB | off | KV math holds | | | | _pending_ |
-| 3 | 262K | 0.85 | fp8, 6 GiB | off | Target context | | | | _pending_ |
+| 2 | 131K | n/a | fp8, 6 GiB | off | KV math holds | — | — | — | _skipped — went straight to 262K_ |
+| 3 | 262K | n/a | fp8, 6 GiB | off | Target context | 6.6 GB idle / 6.1 GB under 60K load | 11.1 GB | ~14.7 | **PASS** |
 | 4 | 262K | 0.85 | fp8, 6 GiB | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _pending_ |
 
 ### Abort criteria — any one, on either node
@@ -221,6 +221,42 @@ kernel." That is expected and correct here: the LibertAI checkpoint is
 fallback. It does mean marlin is not exercising the FP4 tensor cores, which is
 what `flashinfer_cutlass` would do once the nvrtc.h image fix is rebuilt.
 
+## Rung 3 — PASS at the 262K target (2026-09-29)
+
+```
+GPU KV cache size: 925,447 tokens
+Maximum concurrency for 262,144 tokens per request: 3.53x
+Model loading took 88.63 GiB      (vs 89.19 with vision — text-only mode saves 0.56 GiB)
+init engine (profile, create kv cache, warmup model) took 125.40 s
+```
+
+Text-only mode is now confirmed by the engine itself, not inferred:
+
+```
+All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled.
+```
+
+and there is **no multi-modal warmup phase at all** — the thing that killed the
+previous run.
+
+**Long-context recall verified:** a 60,028-token prompt returned
+`The magic word is **"zarquon"**.` Host `MemAvailable` moved 6.6 → 6.1 GB during
+that prefill and settled back to 6.4 GB.
+
+### Memory margin is the real constraint, not KV
+
+| | pulsar | magnetar |
+|---|---|---|
+| idle, model resident @ 262K | **6.6 GB** | 11.1 GB |
+| during 60K-token prefill | **6.1 GB** | 10.6 GB |
+| earlyoom SIGTERM fires at | ~4.9 GB | ~4.9 GB |
+
+So the working margin on pulsar is **~1.2–1.7 GB**. pulsar consistently runs
+~4.5 GB tighter than magnetar and is the binding node. KV is not the limit —
+3.53x concurrency at 262K is ample — host memory is. If a future change needs
+headroom, `KV_CACHE_MEMORY` is the lever with the most slack.
+
 ## Open question: which reasoning parser
 
 **Unresolved — must be probed at rung 1.** The checkpoint card says
@@ -280,9 +316,26 @@ So deepseek_r1 splits on `</think>` correctly but never assigns the prefix to
 generated text and there is none. This is exactly the silent failure this section
 was created to catch: the output looks right, and the reasoning is gone.
 
-**Next:** re-test with `REASONING_PARSER=glm47`, then `glm45`. glm47 is the
-generation that matches this model's tool parser, so it is the leading candidate.
-Each change needs a server restart (~13 min).
+**Tested `glm47`: identical to `deepseek_r1`.** `reasoning_content` is `None`,
+`content` is clean, no leakage. Also tested `chat_template_kwargs` `{"thinking":
+true}` and `{"enable_thinking": true}` — the two keys the adapter actually reads
+(`parser/glm47_moe.py:185-186`) — and **streaming**, which produced 0
+`reasoning_content` deltas and content deltas starting at `#`.
+
+**Conclusion: in this build, no available parser surfaces the reasoning for this
+model.** The parser machinery is behaving as designed — `glm47_moe.py:125` sets
+`initial_state=ParserState.REASONING if thinking`, which is why `content` is
+always clean — but the REASONING events never reach `reasoning_content` in
+either streaming or non-streaming aggregation. That looks like a defect in this
+day-0 build's adapter path, not a misconfiguration.
+
+**What this costs:** nothing for ordinary use — `content` is correct and never
+contaminated. It costs you the model's chain-of-thought, which is simply
+discarded. If you need it, call `/v1/completions` with the rendered prompt (see
+the raw-generation transcript above); the reasoning is present there in full.
+
+**Do not spend more restarts on parser names.** The variable that matters is not
+which parser, it is that this build drops the events.
 
 Do NOT judge a parser by whether `content` looks clean. Judge it by whether
 `reasoning_content` contains the text that appears before `</think>` in the raw
