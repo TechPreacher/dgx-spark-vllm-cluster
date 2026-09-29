@@ -90,6 +90,18 @@ DIST_BACKEND="${DIST_BACKEND:-ray}"
 # and what the 2-Spark recipe specifies, so it is the conservative default.
 # Fallback order if marlin misbehaves: flashinfer_trtllm, then vllm_cutlass.
 MOE_BACKEND="${MOE_BACKEND:-marlin}"
+# Kernel warmup / autotune. The engine gets all the way through KV-cache
+# allocation and then spikes host memory in compile_or_warm_up_model():
+# FlashInfer autotune (~53 s, allocates workspaces) plus repeated TileLang
+# compiles of mhc_pre_big_fuse_with_norm / mhc_fused. Observed 2026-09-29:
+# earlyoom SIGTERMed rank 0 outright there --
+#   sending SIGTERM to process ... "ray::RayWorkerP": badness 1360, VmRSS 5803 MiB
+# -- on pulsar only, which starts with less free memory than magnetar
+# (106.94 vs 110.97 GiB after weights). Disabling the warmups removes that
+# spike and ~1-2 min of startup; the kernels still compile lazily on first use.
+# Re-enable once the memory envelope at the target context is known: autotune
+# is a throughput optimisation, so this trades some speed for getting up at all.
+KERNEL_CONFIG="${KERNEL_CONFIG:-{\"enable_flashinfer_autotune\":false,\"enable_cutedsl_warmup\":false,\"enable_jit_warmup\":false\}}"
 # The patched image's Glm5NextProcessor.from_pretrained does a raw
 #   open(os.path.join(model_path, "processor_config.json"))
 # (transformers_utils/processors/glm5next.py:853) instead of resolving through
@@ -155,6 +167,7 @@ echo "  model:             ${MODEL_CKPT}"
 echo "  TP:                ${TP_SIZE}"
 echo "  executor backend:  ${DIST_BACKEND}"
 echo "  moe backend:       ${MOE_BACKEND}"
+echo "  kernel-config:     ${KERNEL_CONFIG}"
 echo "  max-model-len:     ${MAX_MODEL_LEN}"
 echo "  gpu-mem-util:      ${GPU_MEM_UTIL}"
 echo "  kv-cache-memory:   ${KV_CACHE_MEMORY}"
@@ -281,6 +294,7 @@ docker exec -it \
   -e TP_SIZE="${TP_SIZE}" \
   -e DIST_BACKEND="${DIST_BACKEND}" \
   -e MOE_BACKEND="${MOE_BACKEND}" \
+  -e KERNEL_CONFIG="${KERNEL_CONFIG}" \
   -e PORT="${PORT}" \
   -e EAGER_FLAG="${EAGER_FLAG}" \
   -e SPEC_FLAG="${SPEC_FLAG}" \
@@ -365,6 +379,7 @@ PY
       --tensor-parallel-size "${TP_SIZE}" \
       --distributed-executor-backend "${DIST_BACKEND}" \
       --moe-backend "${MOE_BACKEND}" \
+      --kernel-config "${KERNEL_CONFIG}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --gpu-memory-utilization "${GPU_MEM_UTIL}" \
       --kv-cache-dtype fp8 \

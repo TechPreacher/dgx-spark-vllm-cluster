@@ -109,7 +109,7 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 
 | Rung | ctx | util | KV | Spec | Proves | MemAvail pulsar | MemAvail magnetar | decode tok/s | Result |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 32K | 0.80 | fp8 | off | Weights load; TP2 collectives alive across RoCE | | | | _pending_ |
+| 1 | 32K | 0.80 | fp8, 6 GiB | off | Weights load; TP2 collectives alive across RoCE | | | | _in progress_ |
 | 2 | 131K | 0.85 | fp8, 6 GiB | off | KV math holds | | | | _pending_ |
 | 3 | 262K | 0.85 | fp8, 6 GiB | off | Target context | | | | _pending_ |
 | 4 | 262K | 0.85 | fp8, 6 GiB | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _pending_ |
@@ -180,6 +180,36 @@ time curl -s http://localhost:8000/v1/chat/completions \
   -d '{"model":"zai-org/glm-5.3-flash","messages":[{"role":"user","content":"Write a Python function that merges two sorted lists. Explain it."}],"max_tokens":400}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
 ```
+
+## Measured so far (rung 1, 2026-09-29)
+
+Reached KV-cache allocation successfully:
+
+```
+GPU KV cache size: 449,114 tokens
+Maximum concurrency for 32,768 tokens per request: 13.71x
+Initial free memory: 106.94 GiB (pulsar), 110.97 GiB (magnetar)
+reserved 6.0 GiB for KV Cache as specified by kv_cache_memory_bytes
+```
+
+**449,114 tokens at 6 GiB fp8** is the headline number, and it is very good news
+for rung 3: at 262,144 tokens per request that is still **1.7x concurrency**, so
+the 262K target looks reachable on KV grounds. It also means 6 GiB is generous at
+32K — dropping `KV_CACHE_MEMORY` is a spare lever if host memory stays tight.
+
+**`GPU_MEM_UTIL` is inert in this configuration.** vLLM logs it explicitly:
+"reserved 6.0 GiB ... as specified by kv_cache_memory_bytes config and skipped
+memory profiling. This does not respect the gpu_memory_utilization config."
+Setting `kv_cache_memory_bytes` bypasses profiling entirely, so the util knob
+does nothing unless that is unset. The ladder's util column is therefore
+descriptive, not causal, while `KV_CACHE_MEMORY` is set.
+
+Note also the marlin backend logs "Your GPU does not have native support for FP4
+computation ... Weight-only FP4 compression will be used leveraging the Marlin
+kernel." That is expected and correct here: the LibertAI checkpoint is
+**weight-only NVFP4-A16**, so weight-only decompression is the right path, not a
+fallback. It does mean marlin is not exercising the FP4 tensor cores, which is
+what `flashinfer_cutlass` would do once the nvrtc.h image fix is rebuilt.
 
 ## Open question: which reasoning parser
 
