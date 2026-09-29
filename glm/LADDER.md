@@ -109,7 +109,7 @@ First run downloads ~181 GiB into `~/.cache/huggingface` (381 GB already used,
 
 | Rung | ctx | util | KV | Spec | Proves | MemAvail pulsar | MemAvail magnetar | decode tok/s | Result |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 32K | 0.80 | fp8, 6 GiB | off | Weights load; TP2 collectives alive across RoCE | | | | _in progress_ |
+| 1 | 32K | n/a | fp8, 6 GiB | off | Weights load; TP2 collectives alive across RoCE | 8.1 GB | 12.4 GB | ~14.7 | **PASS** |
 | 2 | 131K | 0.85 | fp8, 6 GiB | off | KV math holds | | | | _pending_ |
 | 3 | 262K | 0.85 | fp8, 6 GiB | off | Target context | | | | _pending_ |
 | 4 | 262K | 0.85 | fp8, 6 GiB | dflash, 7 | Acceptance + tok/s vs published 46.9 / 74.1% | | | | _pending_ |
@@ -181,7 +181,7 @@ time curl -s http://localhost:8000/v1/chat/completions \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
 ```
 
-## Measured so far (rung 1, 2026-09-29)
+## Rung 1 — PASS (2026-09-29)
 
 Reached KV-cache allocation successfully:
 
@@ -192,7 +192,17 @@ Initial free memory: 106.94 GiB (pulsar), 110.97 GiB (magnetar)
 reserved 6.0 GiB for KV Cache as specified by kv_cache_memory_bytes
 ```
 
-**449,114 tokens at 6 GiB fp8** is the headline number, and it is very good news
+First real inference confirmed: `17 × 23 = 391`, correct and cleanly formatted,
+324 completion tokens in 22.0 s ≈ **14.7 tok/s** decode (eager, marlin
+weight-only, no speculation). Steady-state host `MemAvailable` with the model
+resident: **pulsar 8.1 GB, magnetar 12.4 GB**.
+
+That pulsar figure is the number to watch. earlyoom SIGTERMs at ~4.9 GB, so the
+margin at 32K is only ~3.2 GB, and pulsar consistently runs ~4 GB tighter than
+magnetar. Rungs 2 and 3 should be read against this, not against the 113 GB
+idle baseline.
+
+**449,114 tokens at 6 GiB fp8** is the headline KV number, and it is very good news
 for rung 3: at 262,144 tokens per request that is still **1.7x concurrency**, so
 the 262K target looks reachable on KV grounds. It also means 6 GiB is generous at
 32K — dropping `KV_CACHE_MEMORY` is a spare lever if host memory stays tight.
@@ -246,8 +256,43 @@ Correct parser: `reasoning_content` holds the step-by-step working, `content`
 holds just the answer. Wrong parser: `reasoning_content` empty and raw thinking
 leaking into `content`, or the reverse.
 
-Result: _pending_. Once known, set it as the default in
-`glm/launch-glm53-flash.sh` and record the evidence here.
+### Result: `deepseek_r1` LOSES the reasoning (2026-09-29)
+
+Settled by decoding the rendered prompt and generating from it directly.
+
+The chat template ends the prompt with `<|assistant|><think>` (chat_template.jinja
+line 256), so **`<think>` is in the prompt, not the generation**. The model then
+emits its reasoning and closes with `</think>`. Verified raw:
+
+```
+prompt:  '[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is 17*23? ...<|assistant|><think>'
+output:  "The user wants me to calculate 17 × 23 step by step... Both methods give 391...</think>#"
+```
+
+With `--reasoning-parser deepseek_r1` the chat API returns:
+
+* `content` — the post-`</think>` answer, clean, **no leakage** (so this does not
+  look like a broken parser from the outside)
+* `reasoning_content` — **`None`**, i.e. the entire reasoning block is discarded
+
+So deepseek_r1 splits on `</think>` correctly but never assigns the prefix to
+`reasoning_content`, presumably because it expects an opening `<think>` in the
+generated text and there is none. This is exactly the silent failure this section
+was created to catch: the output looks right, and the reasoning is gone.
+
+**Next:** re-test with `REASONING_PARSER=glm47`, then `glm45`. glm47 is the
+generation that matches this model's tool parser, so it is the leading candidate.
+Each change needs a server restart (~13 min).
+
+Do NOT judge a parser by whether `content` looks clean. Judge it by whether
+`reasoning_content` contains the text that appears before `</think>` in the raw
+generation.
+
+### Other kwargs worth knowing
+
+The template's knobs are **`reasoning_effort`** (`low` / `high`, default `max`)
+and **`clear_thinking`** — *not* `enable_thinking`, which the recipes mention and
+which this template ignores entirely.
 
 ## Rung 4 notes: what to watch
 
