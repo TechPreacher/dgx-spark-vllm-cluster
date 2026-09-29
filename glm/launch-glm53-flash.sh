@@ -254,6 +254,7 @@ docker exec -it \
   -e HF_TOKEN="${HF_TOKEN}" \
   -e MODEL_CKPT="${MODEL_CKPT}" \
   -e MODEL_PATH="${MODEL_PATH}" \
+  -e SKIP_WEIGHT_CHECK="${SKIP_WEIGHT_CHECK:-0}" \
   -e SERVED_NAME="${SERVED_NAME}" \
   -e MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
   -e GPU_MEM_UTIL="${GPU_MEM_UTIL}" \
@@ -285,6 +286,52 @@ docker exec -it \
       echo "ERROR: ${MODEL_DIR}/processor_config.json missing -- the glm5next" >&2
       echo "processor reads it by path and will fail without it." >&2
       exit 1
+    fi
+
+    # EVERY node must have the checkpoint, not just this one. The HF cache is
+    # bind-mounted per node, and each rank loads its shard from its own
+    # filesystem. Without this check, a worker missing the weights surfaces ~30s
+    # into engine init as a Ray traceback that names the path but not the cause.
+    # Probe via Ray so we see exactly the nodes Ray will schedule on, through the
+    # same mount the workers use -- no ssh, no assumptions about host names.
+    if [[ "${SKIP_WEIGHT_CHECK}" == "1" ]]; then
+      echo "Skipping the per-node checkpoint check (SKIP_WEIGHT_CHECK=1)."
+    else
+    echo "Checking every Ray node has the checkpoint..."
+    python3 - <<"PY"
+import os, sys, glob, socket
+import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+path = os.environ["MODEL_DIR"]
+ray.init(address="auto", logging_level="ERROR")
+
+@ray.remote(num_cpus=0)
+def probe(p):
+    return (socket.gethostname(),
+            os.path.isdir(p),
+            len(glob.glob(os.path.join(p, "*.safetensors"))))
+
+nodes = [n for n in ray.nodes() if n.get("Alive")]
+refs = [probe.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=n["NodeID"], soft=False)).remote(path) for n in nodes]
+
+bad = []
+for host, is_dir, n_files in ray.get(refs):
+    status = "ok" if (is_dir and n_files) else "MISSING"
+    print(f"  {host:<12} dir={is_dir} safetensors={n_files}  {status}")
+    if not (is_dir and n_files):
+        bad.append(host)
+
+if bad:
+    joined = ", ".join(bad)
+    print("", file=sys.stderr)
+    print("ERROR: checkpoint missing on: " + joined, file=sys.stderr)
+    print("Ray TP loads each shard from its own node filesystem, and the HF", file=sys.stderr)
+    print("cache is per node. Run this on the affected node(s):", file=sys.stderr)
+    print("  bash glm/fetch-weights.sh", file=sys.stderr)
+    raise SystemExit(1)
+PY
     fi
 
     SPEC_ARGS=()

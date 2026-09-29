@@ -51,7 +51,7 @@ docker run --rm \
   --entrypoint /bin/bash \
   "${IMAGE}" -c '
     set -euo pipefail
-    python3 - <<PY
+    python3 - <<"PY"
 import glob, os
 from huggingface_hub import snapshot_download
 path = snapshot_download(os.environ["MODEL_CKPT"])
