@@ -90,6 +90,16 @@ DIST_BACKEND="${DIST_BACKEND:-ray}"
 # and what the 2-Spark recipe specifies, so it is the conservative default.
 # Fallback order if marlin misbehaves: flashinfer_trtllm, then vllm_cutlass.
 MOE_BACKEND="${MOE_BACKEND:-marlin}"
+# Multimodal limits. --skip-mm-profiling does NOT make this a text-only run: it
+# skips the engine's profiling pass, but the API server still warms the vision
+# processor afterwards (renderers/base.py, "Multi-modal warmup"), which took
+# 51s + 24s here and spiked host memory enough for earlyoom to SIGTERM rank 0 --
+# AFTER "Application startup complete", so the server came up and immediately
+# died. The warmup gate is:
+#     mm_limits = {k: v for k, v in allowed_mm_limits.items() if v > 0}
+# so zeroing the limits empties it and the warmup builds no multimodal items.
+# Being text-only therefore means SETTING these to 0, not omitting the flag.
+LIMIT_MM="${LIMIT_MM:-{\"image\":0,\"video\":0\}}"
 # Kernel warmup / autotune. The engine gets all the way through KV-cache
 # allocation and then spikes host memory in compile_or_warm_up_model():
 # FlashInfer autotune (~53 s, allocates workspaces) plus repeated TileLang
@@ -167,6 +177,7 @@ echo "  model:             ${MODEL_CKPT}"
 echo "  TP:                ${TP_SIZE}"
 echo "  executor backend:  ${DIST_BACKEND}"
 echo "  moe backend:       ${MOE_BACKEND}"
+echo "  limit-mm:          ${LIMIT_MM}"
 echo "  kernel-config:     ${KERNEL_CONFIG}"
 echo "  max-model-len:     ${MAX_MODEL_LEN}"
 echo "  gpu-mem-util:      ${GPU_MEM_UTIL}"
@@ -294,6 +305,7 @@ docker exec -it \
   -e TP_SIZE="${TP_SIZE}" \
   -e DIST_BACKEND="${DIST_BACKEND}" \
   -e MOE_BACKEND="${MOE_BACKEND}" \
+  -e LIMIT_MM="${LIMIT_MM}" \
   -e KERNEL_CONFIG="${KERNEL_CONFIG}" \
   -e PORT="${PORT}" \
   -e EAGER_FLAG="${EAGER_FLAG}" \
@@ -390,6 +402,7 @@ PY
       --tool-call-parser glm47 \
       --reasoning-parser "${REASONING_PARSER}" \
       --skip-mm-profiling \
+      --limit-mm-per-prompt "${LIMIT_MM}" \
       ${EAGER_FLAG} \
       ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
   '

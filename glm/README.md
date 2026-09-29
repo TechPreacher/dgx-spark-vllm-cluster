@@ -106,6 +106,11 @@ accepting; `HF_TOKEN` is only for pull rate limits and the launcher's guard.
 `--tool-call-parser glm47` is hardcoded, not a knob: both sources agree on it and
 explicitly warn against `glm` and `glm45`.
 
+`LIMIT_MM` defaults to `{"image":0,"video":0}`. Setting the limits to **zero**
+is what makes a run text-only — omitting the flag does not. `--skip-mm-profiling`
+only skips the engine's profiling pass; the API server still warms the vision
+processor afterwards, which is expensive enough to trigger earlyoom here.
+
 `REASONING_PARSER` is a genuine open question — the checkpoint card says
 `deepseek_r1`, a 2-Spark recipe says `glm45`, and this image also registers
 `glm47`, the generation we already know is correct for *tool* calls. A wrong
